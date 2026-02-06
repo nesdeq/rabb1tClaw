@@ -40,18 +40,12 @@ Multiple providers at once. Switch the active one with a single command.
 git clone https://github.com/nesdeq/rabb1tClaw.git && cd rabb1tClaw
 cargo build --release
 cp .env.example target/release/.env   # fill in your API key(s)
-./target/release/rabb1tclaw init
-```
-
-Init auto-detects your keys, fetches available models, lets you pick, and onboards your first device with a QR code. Takes about 30 seconds.
-
-Then start the server:
-
-```bash
 ./target/release/rabb1tclaw
 ```
 
-Run Server via nohup or in detached terminal and use below cli commands from another.
+First run auto-detects your keys, fetches available models, lets you pick, and onboards your first device with a QR code (swipe left/scan openclaw qr) and runs the server. Takes about 30 seconds.
+
+Use CLI reference below from another terminal while server is running.
 
 ## Config Files
 
