@@ -1,7 +1,9 @@
 //! CLI subcommands, clap structs, and shared helpers.
 
+pub(crate) mod defaults;
 mod devices;
 mod init;
+mod models;
 mod providers;
 mod server;
 
@@ -30,8 +32,10 @@ enum Command {
     Server(server::ServerArgs),
     /// Manage paired devices
     Devices(devices::DevicesArgs),
-    /// Manage LLM providers
+    /// Manage LLM providers (API connections)
     Providers(providers::ProvidersArgs),
+    /// Manage model configurations
+    Models(models::ModelsArgs),
 }
 
 // ============================================================================
@@ -86,6 +90,7 @@ pub async fn run() -> Result<()> {
         Some(Command::Server(args)) => server::dispatch(args).await,
         Some(Command::Devices(args)) => devices::dispatch(args),
         Some(Command::Providers(args)) => providers::dispatch(args).await,
+        Some(Command::Models(args)) => models::dispatch(args).await,
     }
 }
 
@@ -126,11 +131,13 @@ pub(crate) fn mask_key(key: &str) -> String {
     format!("{}...{}", &key[..7], &key[key.len() - 4..])
 }
 
-/// Read a line from stdin
-pub(crate) fn prompt_line() -> Result<String> {
+/// Print a prompt, flush stdout, and read a line from stdin (trimmed)
+pub(crate) fn ask(prompt: &str) -> Result<String> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
-    Ok(line)
+    Ok(line.trim().to_string())
 }
 
 /// Filter models to only include chat-relevant ones
@@ -185,8 +192,9 @@ pub(crate) fn discover_api_keys() -> Vec<(&'static KnownProvider, String)> {
 }
 
 /// Fetch models from a provider, filter, sort, and let user pick one.
-/// Returns None if user skips or no models found.
-pub(crate) async fn pick_model(api_type: &str, base_url: &str, api_key: &str) -> Option<String> {
+/// `skip_label` is shown as the "0)" option (e.g. "Skip this provider" or "Enter manually").
+/// Returns None if user picks 0, no models found, or fetch fails.
+pub(crate) async fn pick_model(api_type: &str, base_url: &str, api_key: &str, skip_label: &str) -> Option<String> {
     println!("Fetching models...");
     let models = crate::provider::list_models(api_type, base_url, api_key).await;
 
@@ -204,15 +212,12 @@ pub(crate) async fn pick_model(api_type: &str, base_url: &str, api_key: &str) ->
             for (i, m) in models.iter().enumerate() {
                 println!("  {:>3}) {}", i + 1, m.id);
             }
-            println!("    0) Skip this provider");
+            println!("    0) {}", skip_label);
 
-            print!("\nPick a model [1]: ");
-            io::stdout().flush().ok();
-            let choice = prompt_line().ok()?;
-            let idx: usize = choice.trim().parse().unwrap_or(1);
+            let choice = ask("\nPick a model [1]: ").ok()?;
+            let idx: usize = choice.parse().unwrap_or(1);
 
             if idx == 0 {
-                println!("Skipped.");
                 return None;
             }
 
@@ -228,6 +233,23 @@ pub(crate) async fn pick_model(api_type: &str, base_url: &str, api_key: &str) ->
             None
         }
     }
+}
+
+// Re-export from defaults module
+pub(crate) use defaults::{apply_smart_defaults, populate_default_agents};
+
+/// Sanitize a model ID into a config-safe key (lowercase alphanumeric + hyphens).
+pub(crate) fn sanitize_model_key(model_id: &str) -> String {
+    let id = model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .to_lowercase();
+    id.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 /// Print quick reference command table (fits 80 cols)
@@ -247,19 +269,15 @@ pub(crate) fn print_quick_reference() {
     println!("  rabb1tclaw providers --list  List providers");
     println!("  rabb1tclaw providers --add   Add a provider");
     println!("  rabb1tclaw providers --remove NAME");
-    println!("  rabb1tclaw providers --set-active NAME");
+    println!("{}", "-".repeat(56));
+    println!("  rabb1tclaw models --list     List models");
+    println!("  rabb1tclaw models --add      Add a model");
+    println!("  rabb1tclaw models --remove KEY");
+    println!("  rabb1tclaw models --set-active KEY");
+    println!("  rabb1tclaw models --edit KEY Edit model params");
     println!("{}", "-".repeat(56));
     println!("  rabb1tclaw init              Re-run setup");
     println!("  rabb1tclaw --help            Full help");
-}
-
-/// Print "provider not found" with available providers list.
-pub(crate) fn print_provider_not_found(name: &str, config: &crate::config::GatewayConfig) {
-    println!("Provider '{}' not found.", name);
-    println!("Available providers:");
-    for key in config.providers.keys() {
-        println!("  {}", key);
-    }
 }
 
 /// Send a signal to the server process identified by PID file.

@@ -11,11 +11,16 @@ use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-/// Shared HTTP client for all LLM requests (connection pooling)
+/// Shared HTTP client for all LLM requests (connection pooling, TCP_NODELAY)
 static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 
 pub fn get_shared_client() -> &'static Client {
-    SHARED_CLIENT.get_or_init(Client::new)
+    SHARED_CLIENT.get_or_init(|| {
+        Client::builder()
+            .tcp_nodelay(true)
+            .build()
+            .expect("failed to build HTTP client")
+    })
 }
 
 // ============================================================================
@@ -32,9 +37,26 @@ pub struct ChatMessage {
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    pub system: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
-    pub system: Option<String>,
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub reasoning_effort: Option<String>,
+    pub thinking: Option<ThinkingParams>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThinkingParams {
+    pub enabled: bool,
+    pub budget_tokens: Option<u32>,
+}
+
+impl From<&crate::config::ThinkingConfig> for ThinkingParams {
+    fn from(t: &crate::config::ThinkingConfig) -> Self {
+        Self { enabled: t.enabled, budget_tokens: t.budget_tokens }
+    }
 }
 
 /// A streaming chunk from the LLM
@@ -83,31 +105,44 @@ pub async fn process_sse_stream(
 
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        while let Some(line_end) = buffer.find('\n') {
-            let line: String = buffer.drain(..=line_end).collect();
-            let line = line.trim();
+        // Parse all complete lines via index scanning — single drain at the end
+        let mut consumed = 0;
+        loop {
+            let rel_end = match buffer[consumed..].find('\n') {
+                Some(pos) => pos,
+                None => break,
+            };
+            let line_end = consumed + rel_end;
 
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-
-            if let Some(data) = line.strip_prefix("data: ") {
-                if let Some(chunk) = parse_data(data) {
-                    match &chunk {
-                        StreamChunk::Text(text) => {
-                            total_chars += text.len();
-                            debug!("[{}] chunk: {}", provider_name, text);
-                        }
-                        StreamChunk::Done => {
-                            info!("[{}] Stream done, total {} chars", provider_name, total_chars);
-                            let _ = tx.send(chunk).await;
-                            return;
-                        }
-                        StreamChunk::Error(_) => {}
-                    }
-                    let _ = tx.send(chunk).await;
+            // Parse inside a block so the buffer borrow is released before any await
+            let maybe_chunk = {
+                let line = buffer[consumed..line_end].trim();
+                if line.is_empty() || line.starts_with(':') {
+                    None
+                } else {
+                    line.strip_prefix("data: ").and_then(|data| parse_data(data))
                 }
+            };
+            consumed = line_end + 1;
+
+            let Some(chunk) = maybe_chunk else { continue };
+
+            match &chunk {
+                StreamChunk::Text(text) => {
+                    total_chars += text.len();
+                    debug!("[{}] chunk: {}", provider_name, text);
+                }
+                StreamChunk::Done => {
+                    info!("[{}] Stream done, total {} chars", provider_name, total_chars);
+                    let _ = tx.send(chunk).await;
+                    return;
+                }
+                StreamChunk::Error(_) => {}
             }
+            let _ = tx.send(chunk).await;
+        }
+        if consumed > 0 {
+            buffer.drain(..consumed);
         }
     }
 
@@ -177,8 +212,6 @@ pub fn create_provider(
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
-    #[allow(dead_code)]
-    pub owned_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,4 +242,3 @@ pub async fn list_models(api_type: &str, base_url: &str, api_key: &str) -> Resul
     let list: ModelListResponse = resp.json().await?;
     Ok(list.data)
 }
-

@@ -26,6 +26,9 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# Deploy scripts
+deploy.*
+
 # Debug/profiling
 *.pdb
 perf.data

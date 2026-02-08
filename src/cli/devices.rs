@@ -1,7 +1,6 @@
 //! `rabb1tclaw devices` — list, onboard, revoke.
 
 use anyhow::Result;
-use std::io::{self, Write};
 
 use crate::config::{
     add_device, create_device, devices_path, generate_connection_json, generate_token,
@@ -59,25 +58,18 @@ fn cmd_list_devices() -> Result<()> {
     }
 
     println!(
-        "\n{:<16} {:<32} {:<8} {}",
-        "NAME", "TOKEN", "STATUS", "LAST SEEN"
+        "\n{:<16} {:<32} {}",
+        "NAME", "TOKEN", "STATUS"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(62));
 
     for device in store.devices.values() {
         let status = if device.revoked { "REVOKED" } else { "active" };
-        let last_conn = device
-            .last_connected_ms
-            .and_then(|ms| chrono::DateTime::from_timestamp((ms / 1000) as i64, 0))
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| "never".to_string());
-
         println!(
-            "{:<16} {:<32} {:<8} {}",
+            "{:<16} {:<32} {}",
             &device.display_name[..device.display_name.len().min(15)],
             device.token,
-            status,
-            last_conn
+            status
         );
     }
 
@@ -129,11 +121,7 @@ fn cmd_revoke_all() -> Result<()> {
 pub(super) fn cmd_onboard(config: &mut GatewayConfig, store: &mut DeviceStore) -> Result<Device> {
     println!("\n=== Device Onboarding ===\n");
 
-    print!("Device name (e.g., 'Rabbit R1', 'iPhone'): ");
-    io::stdout().flush()?;
-
-    let mut name = String::new();
-    io::stdin().read_line(&mut name)?;
+    let name = super::ask("Device name (e.g., 'Rabbit R1', 'iPhone'): ")?;
     let name = name.trim();
 
     let name = if name.is_empty() {

@@ -32,9 +32,9 @@ impl ReloadCoordinator {
         self.sighup_notify.clone()
     }
 
-    /// Run the reload loop - polls every 2 seconds, also wakes on SIGHUP
+    /// Run the reload loop - polls periodically, also wakes on SIGHUP
     pub async fn run(mut self) {
-        let poll_interval = Duration::from_secs(2);
+        let poll_interval = Duration::from_secs(crate::protocol::CONFIG_POLL_SECS);
         info!("reload watcher started ({:?} poll)", poll_interval);
 
         loop {

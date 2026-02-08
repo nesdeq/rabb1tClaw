@@ -1,6 +1,6 @@
 [package]
 name = "rabb1tclaw"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Minimal Rust LLM gateway for Rabbit R1 and other devices"
 license = "MIT"
@@ -8,7 +8,7 @@ repository = "https://github.com/nesdeq/rabb1tClaw"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full", "sync"] }
+tokio = { version = "1", features = ["full"] }
 
 # HTTP server & WebSocket
 axum = { version = "0.7", features = ["ws"] }
@@ -24,6 +24,10 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 # Security
 constant_time_eq = "0.3"
 
+# Encryption (session-at-rest)
+aes-gcm = "0.10"
+sha2 = "0.10"
+
 # Utils
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -38,6 +42,18 @@ dotenvy = "0.15"
 
 # Streaming
 futures = "0.3"
+
+# Tokenization
+tiktoken-rs = "0.9"
+
+hakoniwa = "1.3"
+rs-trafilatura = { git = "https://github.com/Murrough-Foley/rs-trafilatura" }
+
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = true

@@ -1,6 +1,6 @@
 //! WebSocket connection lifecycle: handshake, auth, frame routing, tick, cleanup.
 
-use super::auth::{authorize_connect, is_loopback, AuthResult};
+use super::auth::{authorize_connect, is_loopback, AuthFailure, AuthResult};
 use super::server::ServerState;
 use crate::agent::dispatch_method;
 use crate::config::{config_dir, config_path};
@@ -17,14 +17,14 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, client_ip: String) {
-    let conn_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let conn_id = crate::protocol::short_id();
     let is_local = is_loopback(&client_ip);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut authenticated_token: Option<String> = None;
 
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<OutgoingFrame>(100);
+    let (tx, mut rx) = mpsc::channel::<OutgoingFrame>(crate::protocol::STREAM_CHANNEL_CAPACITY);
 
     // Spawn task to forward outgoing messages
     let send_task = tokio::spawn(async move {
@@ -213,12 +213,12 @@ async fn handle_connect(
             let reason = failure.as_str();
             warn!(conn_id = %conn_id, reason = %reason, "Auth failed");
 
-            let error = auth_result.to_error();
+            let error = ErrorShape::invalid_request(format!("unauthorized: {}", reason));
             let _ = tx.send(OutgoingFrame::Response(
                 ResponseFrame::error(request_id.to_string(), error),
             )).await;
 
-            if auth_result.needs_pairing() {
+            if failure == AuthFailure::NeedsPairing {
                 info!(conn_id = %conn_id, "Waiting for pairing");
                 ConnectOutcome::NeedsPairing
             } else {
@@ -230,7 +230,7 @@ async fn handle_connect(
 
 fn spawn_tick_task(tx: mpsc::Sender<OutgoingFrame>, conn_id: String, shutdown: Arc<AtomicBool>) {
     tokio::spawn(async move {
-        let mut tick_interval = interval(Duration::from_secs(30));
+        let mut tick_interval = interval(Duration::from_secs(crate::protocol::TICK_INTERVAL_SECS));
         tick_interval.tick().await; // Skip first immediate tick
         let mut seq = 1u64;
         loop {

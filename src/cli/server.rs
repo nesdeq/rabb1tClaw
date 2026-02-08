@@ -62,6 +62,9 @@ pub(crate) async fn cmd_server_start() -> Result<()> {
         }
     }
 
+    // Load .env from binary directory so SERP_API_KEY (etc.) are available
+    let _ = dotenvy::from_path(super::binary_env_path());
+
     let config = load_config()?;
     let device_store = load_devices()?;
 
@@ -82,24 +85,28 @@ pub(crate) async fn cmd_server_start() -> Result<()> {
         .bind
         .parse()
         .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let port = config.gateway.port;
 
-    let provider_info = config.active_provider.as_ref()
-        .and_then(|name| config.providers.get(name).map(|p| {
-            format!("{} ({}/{})", name, p.api, p.model)
+    let model_info = config.active_model.as_ref()
+        .and_then(|key| config.models.get(key).map(|m| {
+            format!("{} ({}@{})", key, m.model_id, m.provider)
         }))
         .unwrap_or_else(|| "none".to_string());
 
     info!("config  {}", config_path().display());
     info!("devices {}", devices_path().display());
     info!("bind    {}", bind_ip);
-    info!("provider {}", provider_info);
+    info!("model   {}", model_info);
 
     let gateway_state = Arc::new(
-        GatewayState::new(config.clone(), device_store)
+        GatewayState::new(config, device_store)
             .context("Failed to initialize gateway state")?,
     );
 
-    gateway_state.session_manager.load_from_disk().await;
+    {
+        let ds = gateway_state.device_store.read().await;
+        gateway_state.session_manager.load_from_disk(&ds).await;
+    }
 
     let reload_coordinator = ReloadCoordinator::new(gateway_state.clone());
     let sighup_notify = reload_coordinator.sighup_notifier();
@@ -110,7 +117,7 @@ pub(crate) async fn cmd_server_start() -> Result<()> {
     let server_state = Arc::new(ServerState { gateway: gateway_state });
     let app = create_router(server_state);
 
-    let addr = SocketAddr::new(bind_ip, config.gateway.port);
+    let addr = SocketAddr::new(bind_ip, port);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -119,13 +126,18 @@ pub(crate) async fn cmd_server_start() -> Result<()> {
     info!("listening ws://{}", addr);
     info!("health   http://{}/health", addr);
 
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await
-    .context("Server error")?;
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Shutting down");
+    });
 
+    server.await.context("Server error")?;
+
+    // _pid_guard drops here, removing the PID file
     Ok(())
 }
 

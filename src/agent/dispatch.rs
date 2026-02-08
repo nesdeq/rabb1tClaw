@@ -1,8 +1,8 @@
 //! Method dispatch and simple handlers (health, config.get, chat, sessions, models).
 
-use super::runner::handle_agent;
+use super::runner::{handle_agent, DEFAULT_SESSION_KEY};
 use crate::protocol::{now_ms, ErrorShape};
-use crate::state::HandlerContext;
+use crate::state::{HandlerContext, RunStatus};
 use anyhow::Result;
 use serde_json::json;
 
@@ -20,8 +20,7 @@ pub async fn dispatch_method(
     match method {
         "health" => handle_health(ctx).await,
         "config.get" => handle_config_get(ctx, params).await,
-        "agent" => handle_agent(ctx, params).await,
-        "chat.send" => handle_chat_send(ctx, params).await,
+        "agent" | "chat.send" => handle_agent(ctx, params).await,
         "chat.history" => handle_chat_history(ctx, params).await,
         "chat.abort" => handle_chat_abort(ctx, params).await,
         "sessions.list" => handle_sessions_list(ctx).await,
@@ -67,7 +66,7 @@ async fn handle_config_get(
             let value = match key {
                 "gateway.port" => json!(config.gateway.port),
                 "gateway.bind" => json!(config.gateway.bind),
-                "active_provider" => json!(config.active_provider),
+                "active_model" => json!(config.active_model),
                 _ => serde_json::Value::Null,
             };
             return ctx.respond(json!({ "key": key, "value": value })).await;
@@ -75,27 +74,52 @@ async fn handle_config_get(
     }
 
     // Return full config (sanitized)
-    ctx.respond(json!({
+    let mut resp = json!({
         "gateway": {
             "port": config.gateway.port,
             "bind": config.gateway.bind,
         },
-        "active_provider": config.active_provider,
-    }))
-    .await
+        "active_model": config.active_model,
+    });
+    if let Some(ref agents) = config.agents {
+        let mut agents_obj = serde_json::Map::new();
+        if let Some(ref a) = agents.main {
+            agents_obj.insert("main".to_string(), agent_config_json(a));
+        }
+        if let Some(ref a) = agents.code {
+            agents_obj.insert("code".to_string(), agent_config_json(a));
+        }
+        if let Some(ref a) = agents.memory {
+            agents_obj.insert("memory".to_string(), agent_config_json(a));
+        }
+        if let Some(ref a) = agents.search {
+            agents_obj.insert("search".to_string(), agent_config_json(a));
+        }
+        resp["agents"] = serde_json::Value::Object(agents_obj);
+    }
+    ctx.respond(resp).await
+}
+
+fn thinking_json(t: &crate::config::ThinkingConfig) -> serde_json::Value {
+    json!({ "enabled": t.enabled, "budgetTokens": t.budget_tokens })
+}
+
+fn agent_config_json(a: &crate::config::native::AgentConfig) -> serde_json::Value {
+    json!({
+        "model": a.model,
+        "maxTokens": a.max_tokens,
+        "temperature": a.temperature,
+        "topP": a.top_p,
+        "frequencyPenalty": a.frequency_penalty,
+        "presencePenalty": a.presence_penalty,
+        "reasoningEffort": a.reasoning_effort,
+        "thinking": a.thinking.as_ref().map(thinking_json),
+    })
 }
 
 // ============================================================================
 // Chat
 // ============================================================================
-
-async fn handle_chat_send(
-    ctx: &HandlerContext<'_>,
-    params: Option<serde_json::Value>,
-) -> Result<()> {
-    // For now, delegate to agent handler
-    handle_agent(ctx, params).await
-}
 
 async fn handle_chat_history(
     ctx: &HandlerContext<'_>,
@@ -104,7 +128,7 @@ async fn handle_chat_history(
     let session_key = params
         .as_ref()
         .and_then(|p| p.get("sessionKey").and_then(|s| s.as_str()))
-        .unwrap_or("default:main");
+        .unwrap_or(DEFAULT_SESSION_KEY);
 
     let token = match &ctx.device_token {
         Some(t) => t,
@@ -149,7 +173,7 @@ async fn handle_chat_abort(
     {
         let mut runs = ctx.state.active_runs.write().await;
         if let Some(run) = runs.get_mut(&run_id) {
-            run.status = "aborted".to_string();
+            run.status = RunStatus::Aborted;
         }
     }
 
@@ -176,12 +200,12 @@ async fn handle_sessions_list(ctx: &HandlerContext<'_>) -> Result<()> {
 
     let list: Vec<serde_json::Value> = sessions
         .into_iter()
-        .map(|(key, session)| {
+        .map(|s| {
             json!({
-                "key": key,
-                "turnCount": session.turns.len(),
-                "createdAt": session.created_at_ms,
-                "updatedAt": session.updated_at_ms,
+                "key": s.key,
+                "turnCount": s.turn_count,
+                "createdAt": s.created_at_ms,
+                "updatedAt": s.updated_at_ms,
             })
         })
         .collect();
@@ -200,14 +224,25 @@ async fn handle_models_list(ctx: &HandlerContext<'_>) -> Result<()> {
     let config = ctx.state.gateway_config.read().await;
 
     let models: Vec<serde_json::Value> = config
-        .providers
+        .models
         .iter()
-        .map(|(name, provider)| {
+        .map(|(key, m)| {
+            let is_active = config.active_model.as_deref() == Some(key.as_str());
+            let agents = crate::config::native::model_agent_roles(&config, key);
+
             json!({
-                "id": provider.model,
-                "name": provider.name.as_deref().unwrap_or(name),
-                "provider": name,
-                "api": provider.api,
+                "id": m.model_id,
+                "key": key,
+                "provider": m.provider,
+                "active": is_active,
+                "agents": agents,
+                "maxTokens": m.max_tokens,
+                "temperature": m.temperature,
+                "topP": m.top_p,
+                "frequencyPenalty": m.frequency_penalty,
+                "presencePenalty": m.presence_penalty,
+                "reasoningEffort": m.reasoning_effort,
+                "thinking": m.thinking.as_ref().map(thinking_json),
             })
         })
         .collect();

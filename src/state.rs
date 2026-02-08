@@ -1,5 +1,7 @@
 //! Shared gateway state and handler context.
 
+use crate::agent::code::CodeTaskTracker;
+use crate::agent::search::SearchQueryTracker;
 use crate::agent::session::SessionManager;
 use crate::config::{DeviceStore, GatewayConfig};
 use crate::protocol::{now_ms, ErrorShape, OutgoingFrame, ResponseFrame};
@@ -44,11 +46,32 @@ pub struct GatewayState {
     pub active_connections: RwLock<ConnectionRegistry>,
     /// Conversation session manager
     pub session_manager: SessionManager,
+    /// Background code task tracker
+    pub code_task_tracker: Arc<CodeTaskTracker>,
+    /// Background web search query tracker
+    pub search_query_tracker: Arc<SearchQueryTracker>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Accepted,
+    Aborted,
+    Error,
+}
+
+impl RunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunStatus::Accepted => "accepted",
+            RunStatus::Aborted => "aborted",
+            RunStatus::Error => "error",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct RunState {
-    pub status: String,
+    pub status: RunStatus,
 }
 
 impl GatewayState {
@@ -60,6 +83,8 @@ impl GatewayState {
             device_store: RwLock::new(device_store),
             active_connections: RwLock::new(HashMap::new()),
             session_manager: SessionManager::new(),
+            code_task_tracker: Arc::new(CodeTaskTracker::new()),
+            search_query_tracker: Arc::new(SearchQueryTracker::new()),
         })
     }
 

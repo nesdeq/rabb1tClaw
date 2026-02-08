@@ -1,13 +1,11 @@
-//! `rabb1tclaw providers` — list, add, remove, set-active.
+//! `rabb1tclaw providers` — list, add, remove.
+//!
+//! Providers are API connections only (key + URL + api type).
 
 use anyhow::Result;
-use std::io::{self, Write};
 
 use crate::config::{load_config, save_config, ProviderConfig};
-use super::{
-    discover_api_keys, mask_key, pick_model,
-    print_provider_not_found, prompt_line, KNOWN_PROVIDERS,
-};
+use super::{ask, discover_api_keys, mask_key, KNOWN_PROVIDERS};
 
 #[derive(clap::Args)]
 pub(crate) struct ProvidersArgs {
@@ -22,10 +20,6 @@ pub(crate) struct ProvidersArgs {
     /// Remove a provider by name
     #[arg(long)]
     remove: Option<String>,
-
-    /// Set the active (default) provider by name
-    #[arg(long)]
-    set_active: Option<String>,
 }
 
 pub(crate) async fn dispatch(args: ProvidersArgs) -> Result<()> {
@@ -35,13 +29,10 @@ pub(crate) async fn dispatch(args: ProvidersArgs) -> Result<()> {
     if let Some(ref name) = args.remove {
         return cmd_providers_remove(name);
     }
-    if let Some(ref name) = args.set_active {
-        return cmd_providers_set_active(name);
-    }
     if args.list {
         return cmd_providers_list();
     }
-    println!("No action specified. Use --list, --add, --remove, or --set-active.");
+    println!("No action specified. Use --list, --add, or --remove.");
     println!("Run 'rabb1tclaw providers --help' for details.");
     Ok(())
 }
@@ -56,20 +47,16 @@ fn cmd_providers_list() -> Result<()> {
     }
 
     println!(
-        "\n{:<15} {:<12} {:<35}",
-        "NAME", "API", "MODEL"
+        "\n{:<15} {:<12} {}",
+        "NAME", "API", "BASE_URL"
     );
     println!("{}", "-".repeat(70));
 
     for (key, provider) in &config.providers {
-        let active = if config.active_provider.as_deref() == Some(key) {
-            " <-- active"
-        } else {
-            ""
-        };
+        let display = provider.name.as_deref().unwrap_or(key);
         println!(
-            "{:<15} {:<12} {:<35}{}",
-            key, provider.api, provider.model, active
+            "{:<15} {:<12} {}",
+            display, provider.api, provider.base_url
         );
     }
 
@@ -85,10 +72,8 @@ async fn cmd_providers_add() -> Result<()> {
     }
     println!("  {}) Custom (OpenAI-compatible URL)", KNOWN_PROVIDERS.len() + 1);
 
-    print!("\nChoice: ");
-    io::stdout().flush()?;
-    let choice = prompt_line()?;
-    let choice: usize = choice.trim().parse().unwrap_or(0);
+    let choice = ask("\nChoice: ")?;
+    let choice: usize = choice.parse().unwrap_or(0);
 
     if choice == 0 || choice > KNOWN_PROVIDERS.len() + 1 {
         println!("Invalid choice.");
@@ -104,16 +89,10 @@ async fn cmd_providers_add() -> Result<()> {
             kp.display_name.to_string(),
         )
     } else {
-        print!("Provider name: ");
-        io::stdout().flush()?;
-        let name = prompt_line()?.trim().to_string();
-        print!("Base URL: ");
-        io::stdout().flush()?;
-        let url = prompt_line()?.trim().to_string();
-        print!("API type (openai/anthropic) [openai]: ");
-        io::stdout().flush()?;
-        let api = prompt_line()?;
-        let api = if api.trim().is_empty() { "openai".to_string() } else { api.trim().to_string() };
+        let name = ask("Provider name: ")?;
+        let url = ask("Base URL: ")?;
+        let api = ask("API type (openai/anthropic) [openai]: ")?;
+        let api = if api.is_empty() { "openai".to_string() } else { api };
         let key = name.to_lowercase().replace(' ', "-");
         (api, url, key, name)
     };
@@ -126,46 +105,19 @@ async fn cmd_providers_add() -> Result<()> {
         return Ok(());
     }
 
-    // Pick model
-    let model_id = match pick_model(&api_type, &base_url, &api_key).await {
-        Some(id) => id,
-        None => {
-            print!("Enter model ID manually: ");
-            io::stdout().flush()?;
-            prompt_line()?.trim().to_string()
-        }
-    };
-
-    if model_id.is_empty() {
-        println!("No model selected, aborting.");
-        return Ok(());
-    }
-
     let mut config = load_config()?;
-    let is_first = config.providers.is_empty();
 
     config.providers.insert(
         provider_key.clone(),
-        ProviderConfig {
-            api: api_type,
-            base_url,
-            api_key,
-            model: model_id.clone(),
-            name: Some(display_name.clone()),
-        },
+        ProviderConfig { api: api_type, base_url, api_key, name: Some(display_name.clone()) },
     );
-
-    if is_first {
-        config.active_provider = Some(provider_key.clone());
-    }
 
     save_config(&config)?;
     println!(
-        "\nAdded provider '{}' with model '{}'{}",
+        "\nAdded provider '{}'",
         provider_key,
-        model_id,
-        if is_first { " (active)" } else { "" }
     );
+    println!("Now add a model: rabb1tclaw models --add");
 
     Ok(())
 }
@@ -174,16 +126,34 @@ fn cmd_providers_remove(name: &str) -> Result<()> {
     let mut config = load_config()?;
 
     if config.providers.remove(name).is_none() {
-        print_provider_not_found(name, &config);
+        println!("Provider '{}' not found.", name);
+        if !config.providers.is_empty() {
+            println!("Available providers:");
+            for key in config.providers.keys() {
+                println!("  {}", key);
+            }
+        }
         return Ok(());
     }
 
-    if config.active_provider.as_deref() == Some(name) {
-        config.active_provider = config.providers.keys().next().cloned();
-        if let Some(ref new_active) = config.active_provider {
-            println!("Active provider changed to '{}'", new_active);
-        } else {
-            println!("No providers remaining.");
+    // Remove any models that reference this provider
+    let orphaned_models: Vec<String> = config.models.iter()
+        .filter(|(_, m)| m.provider == name)
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    for key in &orphaned_models {
+        config.models.remove(key);
+        println!("Removed orphaned model '{}'", key);
+    }
+
+    // Fix active model if it was removed
+    if let Some(ref active) = config.active_model {
+        if !config.models.contains_key(active) {
+            config.active_model = config.models.keys().next().cloned();
+            if let Some(ref new_active) = config.active_model {
+                println!("Active model changed to '{}'", new_active);
+            }
         }
     }
 
@@ -193,33 +163,13 @@ fn cmd_providers_remove(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_providers_set_active(name: &str) -> Result<()> {
-    let mut config = load_config()?;
-
-    if !config.providers.contains_key(name) {
-        print_provider_not_found(name, &config);
-        return Ok(());
-    }
-
-    config.active_provider = Some(name.to_string());
-    save_config(&config)?;
-
-    let p = &config.providers[name];
-    println!("Active provider set to '{}' ({})", name, p.model);
-
-    Ok(())
-}
-
 /// Resolve an API key for a provider: check discovered keys first, then prompt.
 fn resolve_api_key(provider_key: &str) -> Result<String> {
-    // Reuse shared discovery logic (checks env vars + .env file)
     let discovered = discover_api_keys();
     if let Some((kp, key)) = discovered.into_iter().find(|(kp, _)| kp.key == provider_key) {
         println!("Using {} = {}", kp.env_var, mask_key(&key));
         return Ok(key);
     }
 
-    print!("API Key: ");
-    io::stdout().flush()?;
-    Ok(prompt_line()?.trim().to_string())
+    ask("API Key: ")
 }

@@ -2,6 +2,7 @@
 
 pub mod devices;
 pub mod native;
+pub mod pid;
 pub mod reload;
 
 // Re-export commonly used types
@@ -12,7 +13,7 @@ pub use devices::{
 };
 pub use native::{
     config_dir, config_exists, config_path, devices_path, load_config, save_config,
-    read_pid_file, PidGuard,
-    GatewayConfig, ProviderConfig,
+    GatewayConfig, ProviderConfig, ModelConfig, ThinkingConfig,
 };
+pub use pid::{read_pid_file, PidGuard};
 pub use reload::{setup_sighup_handler, ReloadCoordinator};

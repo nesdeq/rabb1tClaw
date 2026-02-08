@@ -6,13 +6,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Protocol version
 pub const PROTOCOL_VERSION: u32 = 3;
 
+// ── Infrastructure constants ──
+/// WebSocket tick / keep-alive interval
+pub const TICK_INTERVAL_SECS: u64 = 30;
+/// Max WebSocket frame payload
+pub const WS_MAX_PAYLOAD: u64 = 512 * 1024; // 512KB
+/// Max buffered WebSocket bytes before backpressure
+pub const WS_MAX_BUFFERED: u64 = 1_572_864; // 1.5MB
+/// mpsc channel buffer for streaming chunks
+pub const STREAM_CHANNEL_CAPACITY: usize = 100;
+/// Config/devices file poll interval for hot reload
+pub const CONFIG_POLL_SECS: u64 = 2;
+
 /// Get current timestamp in milliseconds since Unix epoch
 #[inline]
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Generate a short (8-char) random identifier from UUID v4.
+#[inline]
+pub fn short_id() -> String {
+    uuid::Uuid::new_v4().to_string()[..8].to_string()
+}
+
+/// Get current timestamp in seconds since Unix epoch
+#[inline]
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ============================================================================
@@ -31,7 +58,7 @@ pub enum IncomingFrame {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Fields deserialized from client but not all accessed in server logic
+#[allow(dead_code)] // Protocol spec fields — only `auth` accessed; rest kept for forward compat
 pub struct ConnectParams {
     #[serde(rename = "minProtocol")]
     pub min_protocol: u32,
@@ -46,7 +73,7 @@ pub struct ConnectParams {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Protocol spec — deserialized but not accessed server-side
 pub struct ClientInfo {
     pub id: String,
     #[serde(rename = "displayName")]
@@ -59,14 +86,14 @@ pub struct ClientInfo {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Fields deserialized from client auth payload
+#[allow(dead_code)] // Only `token` accessed; `password` reserved for future auth
 pub struct ConnectAuth {
     pub token: Option<String>,
     pub password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Protocol spec — reserved for device crypto auth
 pub struct DeviceAuth {
     pub id: String,
     #[serde(rename = "publicKey")]
@@ -78,7 +105,7 @@ pub struct DeviceAuth {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Protocol fields deserialized but not all used yet
+#[allow(dead_code)] // Only message, idempotency_key accessed; rest reserved for protocol compat
 pub struct AgentParams {
     pub message: String,
     #[serde(rename = "agentId")]
@@ -163,8 +190,6 @@ pub struct EventFrame {
     pub payload: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
-    #[serde(rename = "stateVersion", skip_serializing_if = "Option::is_none")]
-    pub state_version: Option<StateVersion>,
 }
 
 impl EventFrame {
@@ -174,7 +199,6 @@ impl EventFrame {
             event: event.into(),
             payload: None,
             seq: None,
-            state_version: None,
         }
     }
 
@@ -233,7 +257,7 @@ impl ErrorShape {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct StateVersion {
     pub presence: u64,
     pub health: u64,
@@ -332,9 +356,9 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            max_payload: 512 * 1024,              // 512KB (matches TypeScript)
-            max_buffered_bytes: 1572864,          // 1.5MB (matches TypeScript)
-            tick_interval_ms: 30_000,             // 30s
+            max_payload: WS_MAX_PAYLOAD,
+            max_buffered_bytes: WS_MAX_BUFFERED,
+            tick_interval_ms: TICK_INTERVAL_SECS * 1000,
         }
     }
 }
@@ -348,4 +372,3 @@ pub struct AuthInfo {
     #[serde(rename = "issuedAtMs", skip_serializing_if = "Option::is_none")]
     pub issued_at_ms: Option<u64>,
 }
-

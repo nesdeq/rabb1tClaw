@@ -1,7 +1,7 @@
 //! Gateway authentication.
 
 use crate::config::DeviceStore;
-use crate::protocol::{ConnectAuth, ErrorShape};
+use crate::protocol::ConnectAuth;
 
 /// Auth failure reason (protocol-relevant)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,22 +29,6 @@ impl AuthFailure {
 pub enum AuthResult {
     Ok(AuthMethod),
     Failed(AuthFailure),
-}
-
-impl AuthResult {
-    pub fn to_error(&self) -> ErrorShape {
-        match self {
-            AuthResult::Ok(_) => ErrorShape::internal("auth succeeded but to_error called"),
-            AuthResult::Failed(reason) => {
-                ErrorShape::invalid_request(format!("unauthorized: {}", reason.as_str()))
-            }
-        }
-    }
-
-    /// Returns true if device should be kept connected to retry pairing
-    pub fn needs_pairing(&self) -> bool {
-        matches!(self, AuthResult::Failed(AuthFailure::NeedsPairing))
-    }
 }
 
 /// Authentication method used
