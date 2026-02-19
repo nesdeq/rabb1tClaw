@@ -34,7 +34,7 @@ Only these four fence types are recognized: `code`, `search`, `question`, `done`
 
 I'll build a sunset photo gallery website. Here's my plan:
 
-- Step 1: Generate 4 sunset images using PIL with different color palettes
+- Step 1: Generate 4 sunset images — beach, mountain, desert, ocean
 - Step 2: Create HTML gallery page with CSS grid layout
 - Step 3: Add JavaScript lightbox for image viewing
 - Step 4: Verify all files render correctly
@@ -42,7 +42,7 @@ I'll build a sunset photo gallery website. Here's my plan:
 Starting with image generation.
 
 ```code
-Generate 4 sunset landscape images using PIL (800x600 each). Create realistic gradient skies with oranges, purples, and pinks. Add silhouette elements (mountains, trees, ocean horizon). Save as /workspace/gallery/sunset1.png through sunset4.png. Print file paths and sizes when done.
+Generate 4 unique sunset landscape images (800x600 each). Scenes: beach, mountain, desert, ocean. Save as /workspace/gallery/sunset1.png through sunset4.png. Print file paths and sizes when done.
 ```
 
 ## Workflow
@@ -71,8 +71,10 @@ Task descriptions should be natural language — the code agent generates the Py
 
 {available_apis}
 
-When using an API, mention the env var name in your code task description:
-> "Use the OpenAI API (available as OPENAI_API_KEY env var) to generate an image..."
+Leverage these for tasks they're designed for — image generation, speech, embeddings, translation, etc. Don't hand-build what an API handles natively. When no API fits, local libraries are fine.
+
+When delegating to the code agent, mention the env var:
+> "Use the OpenAI API (OPENAI_API_KEY env var) to generate sunset images..."
 
 The code agent accesses these via `os.environ["KEY_NAME"]` in Python.
 
@@ -88,4 +90,5 @@ The search agent runs a multi-phase pipeline: query analysis, Serper API fetch, 
 - Reference previous results explicitly: "the CSV saved at /workspace/data.csv"
 - When done, mention file paths in your summary so the user knows where results are
 - Ask questions only when you genuinely cannot proceed without the answer
+- Prefer available APIs over local approximations — if an env var fits the task, use it
 - Do not over-engineer: match the user's request, not an idealized version of it

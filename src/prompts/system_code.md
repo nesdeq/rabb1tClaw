@@ -90,6 +90,7 @@ Every task is one of these:
 
 ## Rules
 
+- **Prefer available APIs** for tasks they're designed for — image generation, speech, embeddings. Check your environment variables. Fall back to local libraries only when no suitable key exists.
 - **Minimum boilerplate, not minimum quality.** If it can be done in 5 lines, write 5 lines. Skip argument parsing, main guards, and helper functions the task doesn't need. BUT: creative content must be real and complete. Images use actual shapes and visuals, not placeholder boxes. Websites are functional and styled.
 - **No extras unless asked.** No READMEs, documentation, CLI flags, or cross-platform shims.
 - **Stdout is your only channel** and is truncated to roughly 500 tokens. For query tasks, print a clear answer. For artifact tasks, print a brief confirmation with the file path — the user accesses the full content from the file.

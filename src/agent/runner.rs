@@ -136,10 +136,13 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
                 .and_then(|a| a.max_concurrent).unwrap_or(crate::cli::defaults::DEFAULT_ADVANCED_MAX_CONCURRENT),
         )
     };
+    let task_log_max = crate::agent::tasklog::max_entries(&ctx.state).await;
     let mut system_prompt = DEFAULT_SYSTEM_PROMPT
         .replace("{code_max_concurrent}", &code_max.to_string())
         .replace("{search_max_concurrent}", &search_max.to_string())
-        .replace("{advanced_max_concurrent}", &advanced_max.to_string());
+        .replace("{advanced_max_concurrent}", &advanced_max.to_string())
+        .replace("{context_tokens}", &resolved.context_tokens.to_string())
+        .replace("{task_log_max_entries}", &task_log_max.to_string());
 
     // Inject live awareness context
     let _ = write!(system_prompt,
@@ -163,8 +166,6 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
             system_prompt.push_str(&memory);
         }
     }
-
-    let task_log_max = crate::agent::tasklog::max_entries(&state).await;
 
     // Build task context block (persisted log + live running) for user message injection
     let task_context = if device_token.is_some() {
