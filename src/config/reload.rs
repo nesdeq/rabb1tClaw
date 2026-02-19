@@ -39,8 +39,8 @@ impl ReloadCoordinator {
 
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(poll_interval) => {}
-                _ = self.sighup_notify.notified() => {
+                () = tokio::time::sleep(poll_interval) => {}
+                () = self.sighup_notify.notified() => {
                     info!("SIGHUP received, forcing reload");
                 }
             }

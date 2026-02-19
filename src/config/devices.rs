@@ -18,6 +18,7 @@ pub struct DeviceStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct Device {
     /// Device ID (hash of public key or random)
     pub device_id: String,
@@ -28,23 +29,9 @@ pub struct Device {
     /// Authentication token
     pub token: String,
 
-    /// Role (e.g., "operator", "viewer")
-    #[serde(default = "default_role")]
-    pub role: String,
-
-    /// When the device was created (ms since epoch)
-    pub created_at_ms: u64,
-
-    /// When the device last connected (ms since epoch)
-    pub last_connected_ms: Option<u64>,
-
     /// Whether the token is revoked
     #[serde(default)]
     pub revoked: bool,
-}
-
-fn default_role() -> String {
-    "operator".to_string()
 }
 
 // ============================================================================
@@ -59,10 +46,10 @@ pub fn load_devices() -> Result<DeviceStore> {
     }
 
     let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read devices from {:?}", path))?;
+        .with_context(|| format!("Failed to read devices from {}", path.display()))?;
 
     let store: DeviceStore = serde_yml::from_str(&content)
-        .with_context(|| format!("Failed to parse devices from {:?}", path))?;
+        .with_context(|| format!("Failed to parse devices from {}", path.display()))?;
 
     Ok(store)
 }
@@ -94,9 +81,6 @@ pub fn create_device(display_name: &str) -> Device {
         device_id: generate_device_id(),
         display_name: display_name.to_string(),
         token: generate_token(),
-        role: default_role(),
-        created_at_ms: now_ms(),
-        last_connected_ms: None,
         revoked: false,
     }
 }
@@ -141,9 +125,25 @@ pub fn generate_connection_json(config: &GatewayConfig, token: &str) -> String {
     }).to_string()
 }
 
-/// Get LAN IP addresses
+/// Get LAN IP addresses (including Tailscale if available)
 pub fn get_lan_ips() -> Vec<String> {
     let mut ips = Vec::new();
+
+    // Try Tailscale IP first (100.x.y.z range)
+    if let Ok(ts_output) = std::process::Command::new("tailscale")
+        .arg("ip")
+        .arg("-4")
+        .output()
+    {
+        if ts_output.status.success() {
+            if let Ok(ts_ip) = String::from_utf8(ts_output.stdout) {
+                let ts_ip = ts_ip.trim();
+                if !ts_ip.is_empty() {
+                    ips.push(ts_ip.to_string());
+                }
+            }
+        }
+    }
 
     // Try to get network interfaces
     if let Ok(interfaces) = std::process::Command::new("hostname")
@@ -201,12 +201,12 @@ pub fn print_qr_code(data: &str) {
                 .light_color(unicode::Dense1x2::Dark)
                 .quiet_zone(true)
                 .build();
-            println!("{}", image);
+            println!("{image}");
         }
         Err(e) => {
-            eprintln!("Failed to generate QR code: {}", e);
+            eprintln!("Failed to generate QR code: {e}");
             println!("Connection data:");
-            println!("{}", data);
+            println!("{data}");
         }
     }
 }

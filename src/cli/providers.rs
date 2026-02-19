@@ -22,9 +22,9 @@ pub(crate) struct ProvidersArgs {
     remove: Option<String>,
 }
 
-pub(crate) async fn dispatch(args: ProvidersArgs) -> Result<()> {
+pub(crate) fn dispatch(args: &ProvidersArgs) -> Result<()> {
     if args.add {
-        return cmd_providers_add().await;
+        return cmd_providers_add();
     }
     if let Some(ref name) = args.remove {
         return cmd_providers_remove(name);
@@ -47,8 +47,8 @@ fn cmd_providers_list() -> Result<()> {
     }
 
     println!(
-        "\n{:<15} {:<12} {}",
-        "NAME", "API", "BASE_URL"
+        "\n{:<15} {:<12} BASE_URL",
+        "NAME", "API"
     );
     println!("{}", "-".repeat(70));
 
@@ -63,7 +63,7 @@ fn cmd_providers_list() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_providers_add() -> Result<()> {
+fn cmd_providers_add() -> Result<()> {
     println!("\n=== Add Provider ===\n");
 
     println!("Choose provider type:");
@@ -109,13 +109,12 @@ async fn cmd_providers_add() -> Result<()> {
 
     config.providers.insert(
         provider_key.clone(),
-        ProviderConfig { api: api_type, base_url, api_key, name: Some(display_name.clone()) },
+        ProviderConfig { api: api_type, base_url, api_key, name: Some(display_name) },
     );
 
     save_config(&config)?;
     println!(
-        "\nAdded provider '{}'",
-        provider_key,
+        "\nAdded provider '{provider_key}'",
     );
     println!("Now add a model: rabb1tclaw models --add");
 
@@ -126,11 +125,11 @@ fn cmd_providers_remove(name: &str) -> Result<()> {
     let mut config = load_config()?;
 
     if config.providers.remove(name).is_none() {
-        println!("Provider '{}' not found.", name);
+        println!("Provider '{name}' not found.");
         if !config.providers.is_empty() {
             println!("Available providers:");
             for key in config.providers.keys() {
-                println!("  {}", key);
+                println!("  {key}");
             }
         }
         return Ok(());
@@ -144,7 +143,7 @@ fn cmd_providers_remove(name: &str) -> Result<()> {
 
     for key in &orphaned_models {
         config.models.remove(key);
-        println!("Removed orphaned model '{}'", key);
+        println!("Removed orphaned model '{key}'");
     }
 
     // Fix active model if it was removed
@@ -152,13 +151,13 @@ fn cmd_providers_remove(name: &str) -> Result<()> {
         if !config.models.contains_key(active) {
             config.active_model = config.models.keys().next().cloned();
             if let Some(ref new_active) = config.active_model {
-                println!("Active model changed to '{}'", new_active);
+                println!("Active model changed to '{new_active}'");
             }
         }
     }
 
     save_config(&config)?;
-    println!("Removed provider '{}'", name);
+    println!("Removed provider '{name}'");
 
     Ok(())
 }

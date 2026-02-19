@@ -27,11 +27,11 @@ pub(crate) struct DevicesArgs {
     revoke_all: bool,
 }
 
-pub(crate) fn dispatch(args: DevicesArgs) -> Result<()> {
+pub(crate) fn dispatch(args: &DevicesArgs) -> Result<()> {
     if args.onboard {
-        let mut config = load_config()?;
+        let config = load_config()?;
         let mut store = load_devices()?;
-        cmd_onboard(&mut config, &mut store)?;
+        cmd_onboard(&config, &mut store)?;
         return Ok(());
     }
     if let Some(ref id_or_token) = args.revoke {
@@ -58,8 +58,8 @@ fn cmd_list_devices() -> Result<()> {
     }
 
     println!(
-        "\n{:<16} {:<32} {}",
-        "NAME", "TOKEN", "STATUS"
+        "\n{:<16} {:<32} STATUS",
+        "NAME", "TOKEN"
     );
     println!("{}", "-".repeat(62));
 
@@ -73,22 +73,19 @@ fn cmd_list_devices() -> Result<()> {
         );
     }
 
-    println!("\nDevices file: {:?}", devices_path());
+    println!("\nDevices file: {}", devices_path().display());
     Ok(())
 }
 
 fn cmd_revoke_device(id_or_token: &str) -> Result<()> {
     let mut store = load_devices()?;
 
-    match revoke_device(&mut store, id_or_token) {
-        Some(name) => {
-            save_devices(&store)?;
-            println!("Revoked device: {}", name);
-        }
-        None => {
-            println!("Device not found: {}", id_or_token);
-            println!("Use 'rabb1tclaw devices --list' to see available devices.");
-        }
+    if let Some(name) = revoke_device(&mut store, id_or_token) {
+        save_devices(&store)?;
+        println!("Revoked device: {name}");
+    } else {
+        println!("Device not found: {id_or_token}");
+        println!("Use 'rabb1tclaw devices --list' to see available devices.");
     }
 
     Ok(())
@@ -107,18 +104,18 @@ fn cmd_revoke_all() -> Result<()> {
 
     for device_id in device_ids {
         if let Some(name) = revoke_device(&mut store, &device_id) {
-            println!("Revoked: {}", name);
+            println!("Revoked: {name}");
             revoked_count += 1;
         }
     }
 
     save_devices(&store)?;
-    println!("\nRevoked {} device(s).", revoked_count);
+    println!("\nRevoked {revoked_count} device(s).");
 
     Ok(())
 }
 
-pub(super) fn cmd_onboard(config: &mut GatewayConfig, store: &mut DeviceStore) -> Result<Device> {
+pub(super) fn cmd_onboard(config: &GatewayConfig, store: &mut DeviceStore) -> Result<Device> {
     println!("\n=== Device Onboarding ===\n");
 
     let name = super::ask("Device name (e.g., 'Rabbit R1', 'iPhone'): ")?;

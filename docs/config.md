@@ -67,7 +67,7 @@ All agent parameters override the parent model config. Resolution order:
 | `temperature` | inherits model | | |
 | `reasoning_effort` | `"medium"` | | |
 | `context_tokens` | `200000` | tokens (tiktoken) | Conversation history FIFO. Messages trimmed oldest-first when exceeded |
-| `min_context_messages` | `3` | count | Minimum messages kept during context trimming (never trim below this) |
+| `task_log_max_entries` | `50` | count | Max persisted task log entries per device (FIFO). Controls how many completed/failed task results are kept in `tasks.md` |
 
 ### Code Agent (`agents.code`)
 
@@ -80,9 +80,7 @@ All agent parameters override the parent model config. Resolution order:
 | `max_concurrent` | `2` | count | Max parallel code tasks per device |
 | `max_iterations` | `5` | count | Self-healing retry limit. Each iteration: LLM generates code, sandbox executes, if error → retry |
 | `max_output_tokens` | `500` | tokens (tiktoken) | Truncation limit for stdout/stderr captured from sandbox execution. Injected into LLM context for self-healing |
-| `max_status_tokens` | `256` | tokens (tiktoken) | Truncation limit per task in the status block injected into the main agent's system prompt |
 | `exec_timeout_secs` | `120` | seconds | Sandbox execution timeout per iteration |
-| `prune_age_secs` | `3600` | seconds | Cleanup delivered task results after this many seconds |
 
 ### Memory Agent (`agents.memory`)
 
@@ -99,29 +97,30 @@ All agent parameters override the parent model config. Resolution order:
 
 | Parameter | Default | Unit | Description |
 |-----------|---------|------|-------------|
-| `model` | inherits `active_model` | | Model for query analysis, evaluation, and synthesis (all 3 phases) |
+| `model` | inherits `active_model` | | Model for query analysis and synthesis |
 | `reasoning_effort` | `"medium"` | | |
 | `max_concurrent` | `3` | count | Max parallel search queries per device |
 | `max_results` | `10` | count | Serper organic results to fetch per query |
 | `max_news` | `5` | count | Serper news results to fetch per query |
 | `max_people_also_ask` | `5` | count | "People Also Ask" entries to include |
-| `max_total_tokens` | `16000` | tokens (tiktoken) | Total token budget for the final search context injected into the main agent |
-| `max_deep_read_urls` | `5` | count | Max URLs to fetch full page content for in Phase 3 (deep read). Also passed to the evaluate LLM so it knows the limit |
-| `max_page_tokens` | `2500` | tokens (tiktoken) | Per-page token budget for deep-read content. Each fetched page is truncated to this limit before synthesis |
+| `max_total_tokens` | `16000` | tokens (tiktoken) | Total token budget for quick-depth search context |
+| `max_total_tokens_thorough` | `32000` | tokens (tiktoken) | Total token budget for thorough-depth search context |
+| `max_page_tokens` | `4000` | tokens (tiktoken) | Per-page token budget for enriched content. Each fetched page is truncated to this limit |
 | `fetch_timeout_secs` | `15` | seconds | HTTP timeout for fetching deep-read pages |
-| `prune_age_secs` | `3600` | seconds | Cleanup delivered search results after this many seconds |
 
 ---
 
 ## Search Pipeline Phases
 
-The search agent runs a 3-phase pipeline:
+The search agent runs a 5-phase pipeline:
 
-1. **Phase 1 — Query Analysis**: LLM refines the raw query into 1-3 optimized Serper API queries with locale, language, and time filters
-2. **Phase 2 — Evaluate**: Serper results fetched, formatted, and sent to LLM. LLM decides: `"sufficient"` (snippets answer the query) or `"need_deep_read"` (fetch full pages). Up to `max_deep_read_urls` URLs selected proportionally across result categories (organic, news, PAA)
-3. **Phase 3 — Deep Read + Synthesize**: Selected URLs fetched via HTTP (trafilatura text extraction), each truncated to `max_page_tokens`. LLM synthesizes a comprehensive answer from snippets + full page content
+1. **Phase 1 — Query Analysis**: LLM refines the raw query into 1-3 optimized Serper API queries with locale, language, time filters, and a depth decision (`quick` or `thorough`)
+2. **Phase 2 — Multi-Type Serper Fetch**: Parallel API calls — quick depth fetches 1 type per query (web past-day), thorough fetches 3 types (web all-time + past-day + news). Results are deduplicated by URL
+3. **Phase 3 — Enrich**: All result URLs fetched in parallel via HTTP with trafilatura content extraction. Each page truncated to `max_page_tokens`. Failed fetches gracefully degrade to snippet-only
+4. **Phase 4 — Context Assembly**: Token-budgeted assembly of enriched results. Stops adding results when `max_total_tokens` (quick) or `max_total_tokens_thorough` (thorough) would be exceeded
+5. **Phase 5 — Synthesize**: LLM synthesizes a comprehensive answer with sources from the assembled context
 
-Final output truncated to `max_total_tokens` before injection into the main agent's system prompt.
+Graceful degradation to raw Serper snippets when no search model is configured.
 
 ---
 
@@ -148,4 +147,8 @@ Final output truncated to `max_total_tokens` before injection into the main agen
 | `~/.rabb1tclaw/config.yaml` | Main configuration file |
 | `~/.rabb1tclaw/devices.yaml` | Registered device tokens |
 | `~/.rabb1tclaw/<token_prefix>/` | Per-device session data |
-| `~/.rabb1tclaw/<token_prefix>/<session>.memory.md` | Persisted session memory |
+| `~/.rabb1tclaw/<token_prefix>/conversation.enc` | Encrypted conversation session |
+| `~/.rabb1tclaw/<token_prefix>/memory.md` | Persisted session memory |
+| `~/.rabb1tclaw/<token_prefix>/workspace/` | Per-device code execution workspace |
+| `~/.rabb1tclaw/<token_prefix>/tasks.md` | Persistent task log (FIFO, dispatched/completed/failed entries) |
+| `~/.rabb1tclaw/<token_prefix>/advanced_<id>.log` | Admin-visible log for each advanced agent task |

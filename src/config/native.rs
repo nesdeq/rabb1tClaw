@@ -19,8 +19,7 @@ const DEVICES_FILE: &str = "devices.yaml";
 
 pub fn config_dir() -> PathBuf {
     directories::BaseDirs::new()
-        .map(|d| d.home_dir().join(CONFIG_DIR))
-        .unwrap_or_else(|| PathBuf::from(CONFIG_DIR))
+        .map_or_else(|| PathBuf::from(CONFIG_DIR), |d| d.home_dir().join(CONFIG_DIR))
 }
 
 pub fn config_path() -> PathBuf {
@@ -74,7 +73,7 @@ pub struct GatewaySettings {
     pub bind: String,
 }
 
-fn default_port() -> u16 {
+const fn default_port() -> u16 {
     18789
 }
 
@@ -130,7 +129,7 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
 
-    /// "low"/"medium"/"high" — OpenAI o-series reasoning effort
+    /// "low"/"medium"/"high" — `OpenAI` o-series reasoning effort
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 
@@ -180,18 +179,9 @@ pub struct AgentConfig {
     /// Max tokens of stdout/stderr kept per execution (code)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<usize>,
-    /// Deprecated alias for max_output_tokens
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output_chars: Option<usize>,
-    /// Max tokens per task in the status block injected into system prompt (code)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_status_tokens: Option<usize>,
     /// Sandbox execution timeout in seconds (code)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_timeout_secs: Option<u64>,
-    /// Seconds before delivered results are pruned (code, search)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prune_age_secs: Option<u64>,
     /// Run memory extraction every N user turns (memory)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_interval: Option<usize>,
@@ -207,24 +197,24 @@ pub struct AgentConfig {
     /// Max "People Also Ask" entries from Serper (search)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_people_also_ask: Option<usize>,
-    /// Total token budget for all search context (search)
+    /// Total token budget for all search context — quick depth (search)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_tokens: Option<usize>,
-    /// Max URLs to deep-read in Phase 3 (search)
+    /// Total token budget for thorough depth (search, defaults to 32000)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_deep_read_urls: Option<usize>,
+    pub max_total_tokens_thorough: Option<usize>,
     /// Per-page token budget for deep reads (search)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_page_tokens: Option<usize>,
     /// HTTP timeout for fetching deep-read URLs in seconds (search)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_timeout_secs: Option<u64>,
-    /// Minimum conversation messages to keep during context trimming (main)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_context_messages: Option<usize>,
     /// Conversation history FIFO in tokens (main)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
+    /// Max entries in the persistent task log file (main)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_log_max_entries: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -237,6 +227,8 @@ pub struct AgentsSection {
     pub memory: Option<AgentConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<AgentConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advanced: Option<AgentConfig>,
 }
 
 // ============================================================================
@@ -245,7 +237,7 @@ pub struct AgentsSection {
 
 /// Which agent is being resolved — controls default params and inheritance.
 #[derive(Debug, Clone, Copy)]
-pub enum AgentKind { Main, Code, Memory, Search }
+pub enum AgentKind { Main, Code, Memory, Search, Advanced }
 
 impl GatewayConfig {
     /// Quick typed access to a specific agent's config block.
@@ -255,6 +247,7 @@ impl GatewayConfig {
             AgentKind::Code => a.code.as_ref(),
             AgentKind::Memory => a.memory.as_ref(),
             AgentKind::Search => a.search.as_ref(),
+            AgentKind::Advanced => a.advanced.as_ref(),
         })
     }
 }
@@ -265,13 +258,14 @@ impl GatewayConfig {
 
 /// Return which agent roles (e.g. "main", "code", "memory") use a given model key.
 pub fn model_agent_roles(config: &GatewayConfig, model_key: &str) -> Vec<&'static str> {
-    let is_active = config.active_model.as_deref() == Some(model_key);
     const AGENTS: &[(AgentKind, &str)] = &[
         (AgentKind::Main, "main"),
         (AgentKind::Code, "code"),
         (AgentKind::Memory, "memory"),
         (AgentKind::Search, "search"),
+        (AgentKind::Advanced, "advanced"),
     ];
+    let is_active = config.active_model.as_deref() == Some(model_key);
     AGENTS.iter().filter_map(|&(kind, label)| {
         let model = config.agent_config(kind).and_then(|a| a.model.as_ref());
         model.map_or(is_active, |m| m == model_key).then_some(label)
@@ -295,10 +289,10 @@ pub fn load_config() -> Result<GatewayConfig> {
     }
 
     let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read config from {:?}", path))?;
+        .with_context(|| format!("Failed to read config from {}", path.display()))?;
 
     let config: GatewayConfig = serde_yml::from_str(&content)
-        .with_context(|| format!("Failed to parse config from {:?}", path))?;
+        .with_context(|| format!("Failed to parse config from {}", path.display()))?;
 
     Ok(config)
 }
@@ -307,10 +301,10 @@ pub fn load_config() -> Result<GatewayConfig> {
 pub fn write_secure(path: &std::path::Path, content: impl AsRef<[u8]>) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)
-            .with_context(|| format!("Failed to create dir {:?}", dir))?;
+            .with_context(|| format!("Failed to create dir {}", dir.display()))?;
     }
     fs::write(path, content)
-        .with_context(|| format!("Failed to write {:?}", path))?;
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -339,14 +333,14 @@ pub const CODE_AGENT_SYSTEM_PROMPT: &str = include_str!("../prompts/system_code.
 /// System prompt for the memory extraction subagent.
 pub const MEMORY_AGENT_SYSTEM_PROMPT: &str = include_str!("../prompts/system_memory.md");
 
-/// System prompt for search query analysis (Phase 1).
+/// System prompt for search plan generation (depth + query analysis).
 pub const SEARCH_ANALYZE_PROMPT: &str = include_str!("../prompts/system_search_analyze.md");
 
-/// System prompt for search result evaluation (Phase 2).
-pub const SEARCH_EVALUATE_PROMPT: &str = include_str!("../prompts/system_search_evaluate.md");
-
-/// System prompt for deep-read synthesis (Phase 3).
+/// System prompt for deep-read synthesis (final step).
 pub const SEARCH_SYNTHESIZE_PROMPT: &str = include_str!("../prompts/system_search_synthesize.md");
+
+/// System prompt for the advanced orchestrator agent.
+pub const ADVANCED_AGENT_SYSTEM_PROMPT: &str = include_str!("../prompts/system_advanced.md");
 
 /// Commented-out reference appended to every saved config.yaml
 const CONFIG_REFERENCE: &str = r#"
@@ -382,7 +376,7 @@ const CONFIG_REFERENCE: &str = r#"
 #     temperature: 0.9             # override model config params
 #     reasoning_effort: medium     # baseline for reasoning models
 #     context_tokens: 200000       # conversation history FIFO (tokens, tiktoken)
-#     min_context_messages: 3      # minimum messages kept during context trimming
+#     task_log_max_entries: 50     # max entries in persistent task log file
 #   code:
 #     model: cheap-model           # use a different model for code execution
 #     temperature: 0.0
@@ -391,9 +385,7 @@ const CONFIG_REFERENCE: &str = r#"
 #     max_concurrent: 2            # max parallel code tasks per device
 #     max_iterations: 5            # self-healing retry limit
 #     max_output_tokens: 500       # stdout/stderr truncation per execution (tokens, tiktoken)
-#     max_status_tokens: 256       # task summary in system prompt injection (tokens, tiktoken)
 #     exec_timeout_secs: 120       # sandbox timeout
-#     prune_age_secs: 3600         # cleanup delivered results after N seconds
 #   memory:
 #     model: cheap-model           # use a different model for memory extraction
 #     temperature: 0.0
@@ -408,11 +400,17 @@ const CONFIG_REFERENCE: &str = r#"
 #     max_results: 10              # Serper organic results to fetch
 #     max_news: 5                  # Serper news results to fetch
 #     max_people_also_ask: 5       # "People Also Ask" entries to include
-#     max_total_tokens: 16000      # total search context budget (tokens, tiktoken)
-#     max_deep_read_urls: 5        # max URLs to fetch full content for in Phase 3
-#     max_page_tokens: 2500        # per-page budget for deep reads (tokens, tiktoken)
+#     max_total_tokens: 16000      # quick search context budget (tokens, tiktoken)
+#     max_total_tokens_thorough: 32000  # thorough search context budget
+#     max_page_tokens: 4000        # per-page budget for deep reads (tokens, tiktoken)
 #     fetch_timeout_secs: 15       # HTTP timeout for fetching deep-read pages
-#     prune_age_secs: 3600         # cleanup delivered results after N seconds
+#   advanced:
+#     model: smart-model            # model for orchestration planning
+#     reasoning_effort: medium
+#     max_concurrent: 1             # max parallel advanced tasks per device
+#     max_iterations: 20            # max orchestration loop steps
+#     exec_timeout_secs: 600        # total wall-clock timeout for entire task
+#     max_output_tokens: 500        # stdout/stderr truncation for code subtasks
 #
 # ─── How parameters behave per provider ──────────────────────────────
 #

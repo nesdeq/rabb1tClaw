@@ -1,18 +1,20 @@
 //! `rabb1tclaw server` — start, stop, restart, IP management.
 
 use anyhow::{Context, Result};
+use std::io::BufWriter;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
 use crate::config::{
-    config_exists, config_path, devices_path, load_config, load_devices,
+    config_dir, config_exists, config_path, devices_path, load_config, load_devices,
     save_config, read_pid_file, PidGuard, ReloadCoordinator, setup_sighup_handler,
 };
 use crate::connection::{create_router, ServerState};
 use crate::state::GatewayState;
 use super::init_logging;
 
+#[allow(clippy::struct_excessive_bools)] // CLI args are naturally boolean flags
 #[derive(clap::Args)]
 pub(crate) struct ServerArgs {
     /// Update bind IP address and SIGHUP if running
@@ -30,6 +32,10 @@ pub(crate) struct ServerArgs {
     /// Restart a running server (SIGHUP via PID file)
     #[arg(long)]
     restart: bool,
+
+    /// Enable debug logging (debug.log + protocoldump.log in ~/.rabb1tclaw/)
+    #[arg(long)]
+    debug: bool,
 }
 
 pub(crate) async fn dispatch(args: ServerArgs) -> Result<()> {
@@ -47,11 +53,11 @@ pub(crate) async fn dispatch(args: ServerArgs) -> Result<()> {
     if let Some(ip) = args.set_ip {
         return cmd_server_set_ip(&ip);
     }
-    init_logging();
-    cmd_server_start().await
+    init_logging(args.debug);
+    cmd_server_start(args.debug).await
 }
 
-pub(crate) async fn cmd_server_start() -> Result<()> {
+pub(crate) async fn cmd_server_start(debug: bool) -> Result<()> {
     if !config_exists() {
         println!("\n=== Welcome to rabb1tClaw ===\n");
         println!("No configuration found. Running initial setup...\n");
@@ -63,20 +69,25 @@ pub(crate) async fn cmd_server_start() -> Result<()> {
     }
 
     // Load .env from binary directory so SERP_API_KEY (etc.) are available
-    let _ = dotenvy::from_path(super::binary_env_path());
+    let env_path = super::binary_env_path();
+    if let Err(e) = dotenvy::from_path(&env_path) {
+        if env_path.exists() {
+            tracing::warn!("Failed to read .env at {}: {e}", env_path.display());
+        }
+    }
 
     let config = load_config()?;
     let device_store = load_devices()?;
 
     let _pid_guard = PidGuard::new().context("Failed to write PID file")?;
 
-    println!(r#"
+    println!(r"
           _    _    _ _    ___ _
  _ _ __ _| |__| |__/ | |_ / __| |__ ___ __ __
 | '_/ _` | '_ \ '_ \ |  _| (__| / _` \ V  V /
 |_| \__,_|_.__/_.__/_|\__|\___|_\__,_|\_/\_/
   v{}
-"#,
+",
         env!("CARGO_PKG_VERSION"),
     );
 
@@ -84,7 +95,7 @@ pub(crate) async fn cmd_server_start() -> Result<()> {
         .gateway
         .bind
         .parse()
-        .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let port = config.gateway.port;
 
     let model_info = config.active_model.as_ref()
@@ -98,10 +109,18 @@ pub(crate) async fn cmd_server_start() -> Result<()> {
     info!("bind    {}", bind_ip);
     info!("model   {}", model_info);
 
-    let gateway_state = Arc::new(
-        GatewayState::new(config, device_store)
-            .context("Failed to initialize gateway state")?,
-    );
+    let debug_log = if debug {
+        let log_path = config_dir().join("protocoldump.log");
+        let file = std::fs::File::create(&log_path)
+            .with_context(|| format!("Failed to create {}", log_path.display()))?;
+        info!("debug   {}", config_dir().join("debug.log").display());
+        info!("proto   {}", log_path.display());
+        Some(Arc::new(std::sync::Mutex::new(BufWriter::new(file))))
+    } else {
+        None
+    };
+
+    let gateway_state = Arc::new(GatewayState::new(config, device_store, debug_log));
 
     {
         let ds = gateway_state.device_store.read().await;
@@ -143,12 +162,12 @@ pub(crate) async fn cmd_server_start() -> Result<()> {
 
 fn cmd_server_set_ip(ip: &str) -> Result<()> {
     ip.parse::<std::net::IpAddr>()
-        .with_context(|| format!("Invalid IP address: {}", ip))?;
+        .with_context(|| format!("Invalid IP address: {ip}"))?;
 
     let mut config = load_config()?;
     config.gateway.bind = ip.to_string();
     save_config(&config)?;
-    println!("Bind IP updated to {}", ip);
+    println!("Bind IP updated to {ip}");
 
     // SIGHUP if server is running
     if read_pid_file().is_some() {

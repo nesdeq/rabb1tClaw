@@ -1,18 +1,21 @@
-//! Integration test for the 3-phase search pipeline.
+//! Integration test for the search pipeline (plan → multi-type fetch → enrich → context).
 //!
 //! Requires:
-//!   - SERP_API_KEY env var
-//!   - A search model configured in ~/.rabb1tclaw/config.yaml
+//!   - `SERP_API_KEY` env var
+//!   - Optionally a search LLM (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`) for Phase 1
 //!
 //! Run with:
-//!   SERP_API_KEY=... cargo test --test search -- --nocapture
+//!   `SERP_API_KEY`=... cargo test --test search -- --nocapture
 
 
 // ============================================================================
 // Standalone Serper types (mirrors agent.rs — no crate imports possible)
 // ============================================================================
 
+use std::collections::{HashMap, HashSet};
+
 #[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
 struct SerperOrganic {
     title: Option<String>,
     link: Option<String>,
@@ -25,9 +28,12 @@ struct SerperOrganic {
 struct SerperKnowledgeGraph {
     title: Option<String>,
     description: Option<String>,
+    #[serde(default)]
+    attributes: HashMap<String, serde_json::Value>,
 }
 
 #[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
 struct SerperPeopleAlsoAsk {
     question: Option<String>,
     snippet: Option<String>,
@@ -65,28 +71,12 @@ fn default_search_type() -> String { "search".into() }
 
 #[derive(serde::Deserialize, Debug)]
 struct AnalyzeOutput {
+    #[serde(default = "default_depth")]
+    depth: String,
     queries: Vec<AnalyzedQuery>,
 }
 
-// Phase 2 LLM output
-#[derive(serde::Deserialize, Debug)]
-struct EvaluateOutput {
-    verdict: String,
-    #[serde(default)]
-    results: Vec<EvalResult>,
-    #[serde(default)]
-    urls: Vec<String>,
-    #[serde(default)]
-    partial_results: Vec<EvalResult>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct EvalResult {
-    title: Option<String>,
-    url: Option<String>,
-    snippet: Option<String>,
-    date: Option<String>,
-}
+fn default_depth() -> String { "thorough".into() }
 
 // ============================================================================
 // LLM config — from env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY)
@@ -102,10 +92,8 @@ struct ResolvedLlm {
 fn load_env() {
     let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
     if env_path.exists() {
-        for item in dotenvy::from_path_iter(&env_path).expect("Failed to read .env") {
-            if let Ok((k, v)) = item {
-                std::env::set_var(&k, &v);
-            }
+        for (k, v) in dotenvy::from_path_iter(&env_path).expect("Failed to read .env").flatten() {
+            std::env::set_var(&k, &v);
         }
     }
 }
@@ -230,10 +218,7 @@ fn extract_json(response: &str) -> &str {
     }
     if let Some(start) = trimmed.find("```") {
         let after = &trimmed[start + 3..];
-        let after = match after.find('\n') {
-            Some(nl) => &after[nl + 1..],
-            None => after,
-        };
+        let after = after.find('\n').map_or(after, |nl| &after[nl + 1..]);
         if let Some(end) = after.find("```") {
             return after[..end].trim();
         }
@@ -279,7 +264,17 @@ async fn fetch_and_extract(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let resp = client.get(url)
         .timeout(std::time::Duration::from_secs(15))
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Sec-CH-UA", "\"Not(A:Brand\";v=\"8\", \"Chromium\";v=\"144\", \"Google Chrome\";v=\"144\"")
+        .header("Sec-CH-UA-Mobile", "?0")
+        .header("Sec-CH-UA-Platform", "\"Linux\"")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("Upgrade-Insecure-Requests", "1")
         .send().await?
         .error_for_status()?;
     let html = resp.text().await?;
@@ -293,83 +288,37 @@ async fn fetch_and_extract(
     Ok(text)
 }
 
-fn format_serper_results(responses: &[SerperResponse], max_results: usize, max_news: usize, max_paa: usize) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-
-    for resp in responses {
-        if let Some(kg) = &resp.knowledge_graph {
-            if let Some(ref title) = kg.title {
-                let _ = writeln!(out, "**Knowledge Graph:** {}", title);
-                if let Some(ref desc) = kg.description { let _ = writeln!(out, "{}", desc); }
-                let _ = writeln!(out);
-                break;
-            }
-        }
+fn make_variant(aq: &AnalyzedQuery, type_str: &str, tbs: Option<String>) -> AnalyzedQuery {
+    AnalyzedQuery {
+        q: aq.q.clone(),
+        r#type: type_str.to_string(),
+        gl: aq.gl.clone(),
+        hl: aq.hl.clone(),
+        tbs,
+        location: aq.location.clone(),
     }
-    let mut oc = 0;
-    for resp in responses {
-        for r in &resp.organic {
-            if oc >= max_results { break; }
-            let title = r.title.as_deref().unwrap_or("");
-            let url = r.link.as_deref().unwrap_or("");
-            let snippet = r.snippet.as_deref().unwrap_or("");
-            let date = r.date.as_deref().unwrap_or("");
-            if date.is_empty() {
-                let _ = writeln!(out, "- **{}** ({})\n  {}", title, url, snippet);
-            } else {
-                let _ = writeln!(out, "- **{}** ({}) [{}]\n  {}", title, url, date, snippet);
-            }
-            oc += 1;
-        }
-    }
-    let paa: Vec<&SerperPeopleAlsoAsk> = responses.iter().flat_map(|r| r.people_also_ask.iter()).collect();
-    if !paa.is_empty() {
-        let _ = writeln!(out, "\n**People Also Ask:**");
-        for p in paa.iter().take(max_paa) {
-            let _ = writeln!(out, "- Q: {} A: {}", p.question.as_deref().unwrap_or(""), p.snippet.as_deref().unwrap_or(""));
-        }
-    }
-    let mut nc = 0;
-    let mut hdr = false;
-    for resp in responses {
-        for item in &resp.news {
-            if nc >= max_news { break; }
-            if !hdr { let _ = writeln!(out, "\n**Recent News:**"); hdr = true; }
-            let title = item.title.as_deref().unwrap_or("(untitled)");
-            let snippet = item.snippet.as_deref().unwrap_or("");
-            let url = item.link.as_deref().unwrap_or("");
-            let date = item.date.as_deref().unwrap_or("");
-            if date.is_empty() {
-                let _ = writeln!(out, "- {} — {} ({})", title, snippet, url);
-            } else {
-                let _ = writeln!(out, "- {} [{}] — {} ({})", title, date, snippet, url);
-            }
-            nc += 1;
-        }
-    }
-    out
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars { return s.to_string(); }
-    let end = s.floor_char_boundary(max_chars);
+    // Find a char boundary at or before max_chars
+    let mut end = max_chars;
+    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
     s[..end].to_string()
 }
 
-// System prompts — loaded from docs/ the same way the binary does
-const SEARCH_ANALYZE_PROMPT: &str = include_str!("../docs/system_search_analyze.md");
-const SEARCH_EVALUATE_PROMPT: &str = include_str!("../docs/system_search_evaluate.md");
-const SEARCH_SYNTHESIZE_PROMPT: &str = include_str!("../docs/system_search_synthesize.md");
+// System prompt — loaded from src/prompts/
+const SEARCH_ANALYZE_PROMPT: &str = include_str!("../src/prompts/system_search_analyze.md");
 
 // ============================================================================
 // Tests
 // ============================================================================
 
-/// Full 3-phase pipeline with step-by-step output.
-/// Run: SERP_API_KEY=... cargo test --test search search_pipeline_3phase -- --nocapture
+/// Full pipeline: plan → multi-type fetch → enrich → context assembly.
+/// Run: `SERP_API_KEY`=... cargo test --test search `search_pipeline` -- --nocapture
 #[tokio::test]
-async fn search_pipeline_3phase() {
+#[allow(clippy::too_many_lines)]
+async fn search_pipeline() {
     let api_key = match std::env::var("SERP_API_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => { eprintln!("SERP_API_KEY not set — skipping"); return; }
@@ -384,215 +333,231 @@ async fn search_pipeline_3phase() {
     println!("  LLM available: {has_llm}");
     println!("{}\n", "=".repeat(72));
 
-    let query = "Münster Veranstaltungen dieses Wochenende";
+    let query = "Wetter Münster Vorhersage bis Ende der Woche Tageswerte Regen Temperatur Wind";
 
-    // ── PHASE 1 ─────────────────────────────────────────────────────
+    // ── PHASE 1: SEARCH PLAN ──────────────────────────────────────
     println!("┌──────────────────────────────────────────────────────────────┐");
-    println!("│  PHASE 1: QUERY ANALYSIS                                    │");
+    println!("│  PHASE 1: SEARCH PLAN (depth + queries)                     │");
     println!("└──────────────────────────────────────────────────────────────┘");
-    println!("  Input: {:?}\n", query);
+    println!("  Input: {query:?}\n");
 
-    let analyzed = if let Some(ref l) = llm {
+    let (depth, analyzed) = if let Some(ref l) = llm {
         match call_llm(&client, l, SEARCH_ANALYZE_PROMPT, query).await {
             Ok(raw) => {
                 println!("  LLM raw response ({} chars):", raw.len());
-                for line in raw.lines() { println!("    │ {}", line); }
+                for line in raw.lines() { println!("    │ {line}"); }
                 let json_str = extract_json(&raw);
                 match serde_json::from_str::<AnalyzeOutput>(json_str) {
                     Ok(out) => {
-                        println!("\n  Parsed {} queries:", out.queries.len());
+                        let d = if out.depth == "quick" || out.depth == "thorough" {
+                            out.depth
+                        } else {
+                            "thorough".into()
+                        };
+                        println!("\n  Depth: {d}");
+                        println!("  Parsed {} queries:", out.queries.len());
                         for (i, q) in out.queries.iter().enumerate() {
                             println!("    [{}] q={:?} type={:?} gl={:?} hl={:?} tbs={:?} loc={:?}",
                                 i, q.q, q.r#type, q.gl, q.hl, q.tbs, q.location);
                         }
-                        out.queries
+                        (d, out.queries)
                     }
                     Err(e) => {
-                        println!("\n  JSON parse failed: {}", e);
+                        println!("\n  JSON parse failed: {e}");
                         println!("  Falling back to raw query");
-                        vec![AnalyzedQuery { q: query.into(), r#type: "search".into(), gl: None, hl: None, tbs: None, location: None }]
+                        ("thorough".into(), vec![AnalyzedQuery { q: query.into(), r#type: "search".into(), gl: None, hl: None, tbs: None, location: None }])
                     }
                 }
             }
             Err(e) => {
-                println!("  LLM call failed: {}", e);
-                vec![AnalyzedQuery { q: query.into(), r#type: "search".into(), gl: None, hl: None, tbs: None, location: None }]
+                println!("  LLM call failed: {e}");
+                ("thorough".into(), vec![AnalyzedQuery { q: query.into(), r#type: "search".into(), gl: None, hl: None, tbs: None, location: None }])
             }
         }
     } else {
-        println!("  (no LLM configured — raw query)");
-        vec![AnalyzedQuery { q: query.into(), r#type: "search".into(), gl: None, hl: None, tbs: None, location: None }]
+        println!("  (no LLM configured — raw query, thorough depth)");
+        ("thorough".into(), vec![AnalyzedQuery { q: query.into(), r#type: "search".into(), gl: None, hl: None, tbs: None, location: None }])
     };
 
-    // ── PHASE 2a ────────────────────────────────────────────────────
+    // ── PHASE 2: MULTI-TYPE SERPER FETCH ──────────────────────────
     println!("\n┌──────────────────────────────────────────────────────────────┐");
-    println!("│  PHASE 2a: SERPER FETCH                                     │");
+    println!("│  PHASE 2: MULTI-TYPE SERPER FETCH (depth={depth:10})       │");
     println!("└──────────────────────────────────────────────────────────────┘");
 
+    // Expand queries into search variants based on depth
+    let mut search_queries = Vec::new();
+    for aq in &analyzed {
+        if depth == "quick" {
+            search_queries.push(("web_past_day", make_variant(aq, "search", Some("qdr:d".into()))));
+        } else {
+            search_queries.push(("web_all_time", make_variant(aq, "search", aq.tbs.clone())));
+            search_queries.push(("web_past_day", make_variant(aq, "search", Some("qdr:d".into()))));
+            search_queries.push(("news", make_variant(aq, "news", None)));
+        }
+    }
+
     let mut all_responses: Vec<SerperResponse> = Vec::new();
-    for (i, aq) in analyzed.iter().enumerate() {
-        let num = if aq.r#type == "news" { 5 } else { 10 };
-        println!("  [{}] q={:?} type={} num={}", i, aq.q, aq.r#type, num);
-        match fetch_serper(&client, &api_key, aq, num).await {
+    for (i, (label, sq)) in search_queries.iter().enumerate() {
+        let num = if sq.r#type == "news" { 5 } else { 10 };
+        println!("  [{}] {} — q={:?} type={} num={}", i, label, sq.q, sq.r#type, num);
+        match fetch_serper(&client, &api_key, sq, num).await {
             Ok(resp) => {
                 println!("      {} organic, {} news, kg={}, {} PAA",
                     resp.organic.len(), resp.news.len(),
                     resp.knowledge_graph.is_some(), resp.people_also_ask.len());
-                // Print first 3 organic titles
-                for (j, r) in resp.organic.iter().take(3).enumerate() {
-                    println!("      organic[{}]: {} — {}", j,
-                        r.title.as_deref().unwrap_or("?"),
-                        r.link.as_deref().unwrap_or("?"));
-                }
                 all_responses.push(resp);
             }
-            Err(e) => println!("      FAILED: {}", e),
+            Err(e) => println!("      FAILED: {e}"),
         }
     }
 
     assert!(!all_responses.is_empty(), "All Serper requests failed — check SERP_API_KEY");
 
-    let results_text = format_serper_results(&all_responses, 10, 5, 5);
-    println!("\n  Formatted results: {} chars", results_text.len());
-    println!("  ─── begin ───");
-    let preview = truncate(&results_text, 3000);
-    for line in preview.lines() { println!("  │ {}", line); }
-    if results_text.len() > 3000 { println!("  │ ... ({} more chars)", results_text.len() - 3000); }
-    println!("  ─── end ───");
+    // Deduplicate results
+    let mut seen_urls = HashSet::new();
+    let mut unique_urls: Vec<(String, String, String)> = Vec::new(); // (title, url, snippet)
 
-    // ── PHASE 2b ────────────────────────────────────────────────────
-    println!("\n┌──────────────────────────────────────────────────────────────┐");
-    println!("│  PHASE 2b: EVALUATE                                         │");
-    println!("└──────────────────────────────────────────────────────────────┘");
-
-    let final_output = if let Some(ref l) = llm {
-        let eval_input = format!("## Original Query\n\n{}\n\n## Search Results\n\n{}", query, results_text);
-        match call_llm(&client, l, SEARCH_EVALUATE_PROMPT, &eval_input).await {
-            Ok(raw) => {
-                println!("  LLM raw response ({} chars):", raw.len());
-                let raw_preview = truncate(&raw, 2000);
-                for line in raw_preview.lines() { println!("    │ {}", line); }
-                if raw.len() > 2000 { println!("    │ ... ({} more)", raw.len() - 2000); }
-
-                let json_str = extract_json(&raw);
-                match serde_json::from_str::<EvaluateOutput>(json_str) {
-                    Ok(eval) => {
-                        println!("\n  Verdict: {}", eval.verdict);
-                        println!("  Results: {} items", eval.results.len());
-                        println!("  Partial: {} items", eval.partial_results.len());
-                        println!("  URLs for deep read: {:?}", eval.urls);
-
-                        if eval.verdict == "need_deep_read" && !eval.urls.is_empty() {
-                            // ── PHASE 3 ─────────────────────────────────
-                            println!("\n┌──────────────────────────────────────────────────────────────┐");
-                            println!("│  PHASE 3: DEEP READ + SYNTHESIZE                             │");
-                            println!("└──────────────────────────────────────────────────────────────┘");
-
-                            let urls: Vec<&str> = eval.urls.iter().take(3).map(|s| s.as_str()).collect();
-
-                            // Fetch each URL
-                            for (i, &url) in urls.iter().enumerate() {
-                                print!("  [{}] {} ... ", i, url);
-                                match fetch_and_extract(&client, url).await {
-                                    Ok(content) => {
-                                        println!("{} chars", content.len());
-                                        let p = truncate(&content, 200);
-                                        println!("      {:?}...", p);
-                                    }
-                                    Err(e) => println!("FAILED: {}", e),
-                                }
-                            }
-
-                            // Build synthesis input
-                            let mut pages = String::new();
-                            let mut futs = Vec::new();
-                            for &url in &urls {
-                                let c = client.clone();
-                                let u = url.to_string();
-                                futs.push(async move { (u.clone(), fetch_and_extract(&c, &u).await) });
-                            }
-                            let results = futures::future::join_all(futs).await;
-                            for (url, res) in results {
-                                match res {
-                                    Ok(content) => {
-                                        let t = truncate(&content, 8000);
-                                        pages.push_str(&format!("--- Page: {} ---\n{}\n\n", url, t));
-                                    }
-                                    Err(e) => {
-                                        pages.push_str(&format!("--- Page: {} ---\n(failed: {})\n\n", url, e));
-                                    }
-                                }
-                            }
-
-                            let synth_input = format!(
-                                "## Original Query\n\n{}\n\n## Search Snippets\n\n{}\n\n## Full Page Content\n\n{}",
-                                query, results_text, pages);
-
-                            println!("\n  Calling synthesis LLM ({} chars input)...", synth_input.len());
-
-                            match call_llm(&client, l, SEARCH_SYNTHESIZE_PROMPT, &synth_input).await {
-                                Ok(synth) => {
-                                    println!("  Synthesis: {} chars\n", synth.len());
-                                    synth
-                                }
-                                Err(e) => {
-                                    println!("  Synthesis FAILED: {}\n  Using partial results", e);
-                                    format_partial(&eval.partial_results)
-                                }
-                            }
-                        } else {
-                            println!("\n  Snippets sufficient — using evaluated results");
-                            format_partial(&eval.results)
-                        }
-                    }
-                    Err(e) => {
-                        println!("  JSON parse failed: {}", e);
-                        println!("  Using raw Serper results");
-                        results_text
-                    }
+    for resp in &all_responses {
+        // Knowledge graph
+        if let Some(kg) = &resp.knowledge_graph {
+            if let Some(ref title) = kg.title {
+                let mut body = kg.description.clone().unwrap_or_default();
+                if !kg.attributes.is_empty() {
+                    let attrs: String = kg.attributes.iter()
+                        .map(|(k, v)| format!("{}: {}", k, v.as_str().unwrap_or(&v.to_string())))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    if !body.is_empty() { body.push_str(" | "); }
+                    body.push_str(&attrs);
+                }
+                if seen_urls.insert("#knowledge_graph".to_string()) {
+                    unique_urls.push((title.clone(), "#knowledge_graph".into(), body));
                 }
             }
-            Err(e) => {
-                println!("  LLM call failed: {}", e);
-                results_text
+        }
+        for r in &resp.organic {
+            let url = r.link.as_deref().unwrap_or("").to_string();
+            if !url.is_empty() && seen_urls.insert(url.clone()) {
+                unique_urls.push((
+                    r.title.as_deref().unwrap_or("").to_string(),
+                    url,
+                    r.snippet.as_deref().unwrap_or("").to_string(),
+                ));
             }
         }
-    } else {
-        println!("  (no LLM — raw results)");
-        results_text
-    };
+        for r in &resp.news {
+            let url = r.link.as_deref().unwrap_or("").to_string();
+            if !url.is_empty() && seen_urls.insert(url.clone()) {
+                unique_urls.push((
+                    r.title.as_deref().unwrap_or("").to_string(),
+                    url,
+                    r.snippet.as_deref().unwrap_or("").to_string(),
+                ));
+            }
+        }
+    }
+
+    println!("\n  Total unique results: {}", unique_urls.len());
+    for (i, (title, url, _)) in unique_urls.iter().take(10).enumerate() {
+        println!("    [{}] {} — {}", i, title, truncate(url, 60));
+    }
+    if unique_urls.len() > 10 {
+        println!("    ... and {} more", unique_urls.len() - 10);
+    }
+
+    // ── PHASE 3: ENRICH (fetch page content) ──────────────────────
+    println!("\n┌──────────────────────────────────────────────────────────────┐");
+    println!("│  PHASE 3: ENRICH (fetch page content)                       │");
+    println!("└──────────────────────────────────────────────────────────────┘");
+
+    let max_fetch = 10;
+    let fetchable: Vec<&(String, String, String)> = unique_urls.iter()
+        .filter(|(_, url, _)| !url.starts_with('#'))
+        .take(max_fetch)
+        .collect();
+
+    println!("  Fetching {} URLs...\n", fetchable.len());
+
+    let mut enriched_content: Vec<(String, String, String, String)> = Vec::new(); // (title, url, snippet, content)
+
+    // Add non-fetchable results first
+    for (title, url, snippet) in &unique_urls {
+        if url.starts_with('#') {
+            enriched_content.push((title.clone(), url.clone(), snippet.clone(), snippet.clone()));
+        }
+    }
+
+    // Fetch all URLs in parallel
+    let mut futs = Vec::new();
+    for (_, url, _) in &fetchable {
+        let c = client.clone();
+        let u = url.clone();
+        futs.push(async move { (u.clone(), fetch_and_extract(&c, &u).await) });
+    }
+    let results = futures::future::join_all(futs).await;
+
+    let mut fetched_count = 0;
+    for (i, (url, res)) in results.iter().enumerate() {
+        let (title, _, snippet) = fetchable[i];
+        match res {
+            Ok(content) => {
+                let trimmed = truncate(content, 5000);
+                println!("  [{}] {} chars — {}", i, content.len(), truncate(url, 50));
+                enriched_content.push((title.clone(), url.clone(), snippet.clone(), trimmed));
+                fetched_count += 1;
+            }
+            Err(e) => {
+                println!("  [{}] FAILED — {} — {}", i, truncate(url, 50), e);
+                enriched_content.push((title.clone(), url.clone(), snippet.clone(), String::new()));
+            }
+        }
+    }
+
+    println!("\n  Successfully fetched: {}/{}", fetched_count, fetchable.len());
+
+    // ── PHASE 4: TOKEN-BUDGETED CONTEXT ASSEMBLY ──────────────────
+    println!("\n┌──────────────────────────────────────────────────────────────┐");
+    println!("│  PHASE 4: CONTEXT ASSEMBLY                                  │");
+    println!("└──────────────────────────────────────────────────────────────┘");
+
+    let max_context_chars = 32000; // simplified char limit for test
+    let mut context = String::new();
+    let mut included = 0;
+
+    for (title, url, snippet, content) in &enriched_content {
+        let content_section = if content.is_empty() { snippet } else { content };
+        let entry = format!(
+            "Title: {title}\nURL: {url}\nSnippet: {snippet}\nContent: {content_section}\n\n"
+        );
+        if context.len() + entry.len() > max_context_chars {
+            println!("  Char limit reached at {included} results");
+            break;
+        }
+        context.push_str(&entry);
+        included += 1;
+    }
+
+    println!("  Included: {}/{} results", included, enriched_content.len());
+    println!("  Context: {} chars", context.len());
 
     // ── FINAL OUTPUT ────────────────────────────────────────────────
-    let final_text = truncate(&final_output, 32000);
+    let final_text = truncate(&context, 32000);
 
     println!("\n{}", "=".repeat(72));
-    println!("  FINAL OUTPUT ({} chars)", final_text.len());
+    println!("  FINAL CONTEXT ({} chars, {} results)", final_text.len(), included);
     println!("{}\n", "=".repeat(72));
-    for line in final_text.lines() { println!("  {}", line); }
+    // Show first 3000 chars
+    let preview = truncate(&final_text, 3000);
+    for line in preview.lines() { println!("  {line}"); }
+    if final_text.len() > 3000 { println!("\n  ... ({} more chars)", final_text.len() - 3000); }
     println!("\n{}", "=".repeat(72));
 
     assert!(!final_text.is_empty(), "Final output empty");
     assert!(final_text.len() > 50, "Output suspiciously short: {} chars", final_text.len());
+    assert!(included > 0, "No results included in context");
 }
 
-fn format_partial(results: &[EvalResult]) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-    for r in results {
-        let title = r.title.as_deref().unwrap_or("");
-        let url = r.url.as_deref().unwrap_or("");
-        let snippet = r.snippet.as_deref().unwrap_or("");
-        let date = r.date.as_deref().unwrap_or("");
-        if date.is_empty() {
-            let _ = writeln!(out, "- **{}** ({})\n  {}", title, url, snippet);
-        } else {
-            let _ = writeln!(out, "- **{}** ({}) [{}]\n  {}", title, url, date, snippet);
-        }
-    }
-    out
-}
-
-/// Smoke test: extract_json strips markdown fences correctly.
+/// Smoke test: `extract_json` strips markdown fences correctly.
 #[test]
 fn test_extract_json_fenced() {
     assert_eq!(
@@ -603,7 +568,7 @@ fn test_extract_json_fenced() {
 
 #[test]
 fn test_extract_json_raw() {
-    let input = r#"{"verdict": "sufficient", "results": []}"#;
+    let input = r#"{"depth": "thorough", "queries": []}"#;
     assert_eq!(extract_json(input), input);
 }
 

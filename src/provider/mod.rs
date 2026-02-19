@@ -1,4 +1,4 @@
-//! LLM provider implementations (OpenAI, Anthropic).
+//! LLM provider implementations (`OpenAI`, `Anthropic`).
 
 pub mod anthropic;
 pub mod openai;
@@ -9,9 +9,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
-/// Shared HTTP client for all LLM requests (connection pooling, TCP_NODELAY)
+/// Shared HTTP client for all LLM requests (connection pooling, `TCP_NODELAY`)
 static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 
 pub fn get_shared_client() -> &'static Client {
@@ -97,7 +97,7 @@ pub async fn process_sse_stream(
         let chunk = match chunk_result {
             Ok(c) => c,
             Err(e) => {
-                warn!("[{}] Stream error: {}", provider_name, e);
+                debug!("[{}] Stream error: {}", provider_name, e);
                 let _ = tx.send(StreamChunk::Error(e.to_string())).await;
                 return;
             }
@@ -107,11 +107,7 @@ pub async fn process_sse_stream(
 
         // Parse all complete lines via index scanning — single drain at the end
         let mut consumed = 0;
-        loop {
-            let rel_end = match buffer[consumed..].find('\n') {
-                Some(pos) => pos,
-                None => break,
-            };
+        while let Some(rel_end) = buffer[consumed..].find('\n') {
             let line_end = consumed + rel_end;
 
             // Parse inside a block so the buffer borrow is released before any await
@@ -120,7 +116,7 @@ pub async fn process_sse_stream(
                 if line.is_empty() || line.starts_with(':') {
                     None
                 } else {
-                    line.strip_prefix("data: ").and_then(|data| parse_data(data))
+                    line.strip_prefix("data: ").and_then(&parse_data)
                 }
             };
             consumed = line_end + 1;
@@ -133,7 +129,7 @@ pub async fn process_sse_stream(
                     debug!("[{}] chunk: {}", provider_name, text);
                 }
                 StreamChunk::Done => {
-                    info!("[{}] Stream done, total {} chars", provider_name, total_chars);
+                    debug!("[{}] Stream done, total {} chars", provider_name, total_chars);
                     let _ = tx.send(chunk).await;
                     return;
                 }
@@ -146,7 +142,7 @@ pub async fn process_sse_stream(
         }
     }
 
-    info!("[{}] Stream ended, total {} chars", provider_name, total_chars);
+    debug!("[{}] Stream ended, total {} chars", provider_name, total_chars);
     let _ = tx.send(StreamChunk::Done).await;
 }
 
@@ -160,22 +156,21 @@ pub async fn send_and_stream(
     let resp = match request.send().await {
         Ok(r) => r,
         Err(e) => {
-            warn!("[{}] Request error: {}", provider_name, e);
+            debug!("[{}] Request error: {}", provider_name, e);
             let _ = tx.send(StreamChunk::Error(e.to_string())).await;
             return;
         }
     };
 
-    info!("[{}] Response status: {}", provider_name, resp.status());
+    debug!("[{}] Response status: {}", provider_name, resp.status());
 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        warn!("[{}] Error {}: {}", provider_name, status, text);
+        debug!("[{}] Error {}: {}", provider_name, status, text);
         let _ = tx
             .send(StreamChunk::Error(format!(
-                "{} API error {}: {}",
-                provider_name, status, text
+                "{provider_name} API error {status}: {text}"
             )))
             .await;
         return;
@@ -219,7 +214,7 @@ struct ModelListResponse {
     data: Vec<ModelInfo>,
 }
 
-/// List models from any supported API. Headers are set based on api_type.
+/// List models from any supported API. Headers are set based on `api_type`.
 pub async fn list_models(api_type: &str, base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let mut req = get_shared_client().get(&url);
@@ -236,7 +231,7 @@ pub async fn list_models(api_type: &str, base_url: &str, api_key: &str) -> Resul
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("API error {}: {}", status, text);
+        anyhow::bail!("API error {status}: {text}");
     }
 
     let list: ModelListResponse = resp.json().await?;

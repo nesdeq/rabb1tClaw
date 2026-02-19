@@ -1,11 +1,11 @@
-//! OpenAI provider implementation.
+//! `OpenAI` provider implementation.
 
 use super::{get_shared_client, send_and_stream, ChatRequest, LlmProvider, StreamChunk};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::debug;
 
 pub struct OpenAiProvider {
     base_url: String,
@@ -39,7 +39,7 @@ struct OpenAiRequest {
     presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
-    /// vLLM extension: controls thinking for OSS reasoning models on DeepInfra etc.
+    /// vLLM extension: controls thinking for OSS reasoning models on `DeepInfra` etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
     stream: bool,
@@ -69,10 +69,10 @@ struct OpenAiStreamChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiDelta {
     content: Option<String>,
-    /// OSS reasoning models (DeepSeek R1, Qwen QwQ, etc.) on vLLM-backed providers
+    /// OSS reasoning models (`DeepSeek` R1, Qwen `QwQ`, etc.) on vLLM-backed providers
     /// return chain-of-thought here instead of inline <think> tags.
     /// We intentionally parse and discard it — only `content` is forwarded.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // serde target: parsed so the field doesn't reject; intentionally discarded
     reasoning_content: Option<String>,
 }
 
@@ -93,8 +93,8 @@ fn parse_openai_sse(data: &str) -> Option<StreamChunk> {
     Some(StreamChunk::Text(content.clone()))
 }
 
-/// Check if a model is a reasoning model that requires max_completion_tokens
-/// instead of max_tokens, and supports reasoning_effort.
+/// Check if a model is a reasoning model that requires `max_completion_tokens`
+/// instead of `max_tokens`, and supports `reasoning_effort`.
 /// Covers: o-series (o1, o3, o4-mini, …) and GPT-5.x (gpt-5, gpt-5.2, …)
 pub fn is_reasoning_model(model: &str) -> bool {
     let m = model.to_lowercase();
@@ -156,7 +156,7 @@ impl LlmProvider for OpenAiProvider {
         };
 
         let url = format!("{}/chat/completions", self.base_url);
-        info!("[OpenAI] stream model={}", request.model);
+        debug!("[OpenAI] stream model={}", request.model);
         for msg in &body.messages {
             debug!("[OpenAI] {} : {}",
                 msg.role,

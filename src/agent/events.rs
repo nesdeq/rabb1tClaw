@@ -1,9 +1,7 @@
 //! Streaming event emission helpers for agent responses.
 
 use crate::protocol::{now_ms, ErrorShape, EventFrame, OutgoingFrame, ResponseFrame};
-use crate::state::{GatewayState, RunStatus};
 use serde_json::json;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::runner::DEFAULT_SESSION_KEY;
@@ -73,21 +71,12 @@ pub(crate) async fn emit_stream_done(
 /// Emit error events (lifecycle + chat) and send error response.
 pub(crate) async fn emit_run_error(
     tx: &mpsc::Sender<OutgoingFrame>,
-    state: &Arc<GatewayState>,
     run_id: &str,
     request_id: &str,
     seq: u64,
     error_msg: &str,
 ) {
     let ended_at = now_ms();
-
-    // Update run state to error
-    {
-        let mut runs = state.active_runs.write().await;
-        if let Some(run) = runs.get_mut(run_id) {
-            run.status = RunStatus::Error;
-        }
-    }
 
     let error_event = EventFrame::new("agent").with_payload(json!({
         "runId": run_id, "seq": seq, "stream": "lifecycle",
@@ -97,7 +86,7 @@ pub(crate) async fn emit_run_error(
 
     let chat_error = EventFrame::new("chat").with_payload(json!({
         "runId": run_id, "sessionKey": DEFAULT_SESSION_KEY,
-        "seq": seq + 1, "state": "error", "error": error_msg
+        "seq": seq + 1, "state": "error", "errorMessage": error_msg
     }));
     let _ = tx.send(OutgoingFrame::Event(chat_error)).await;
 

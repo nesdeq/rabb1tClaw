@@ -9,6 +9,7 @@ use crate::config::{
 use super::{apply_smart_defaults, ask, discover_api_keys, mask_key, pick_model, print_quick_reference, sanitize_model_key};
 use super::devices::cmd_onboard;
 
+#[allow(clippy::too_many_lines)]
 pub async fn cmd_init() -> Result<()> {
     println!("\n=== rabb1tClaw Init ===\n");
 
@@ -51,7 +52,7 @@ pub async fn cmd_init() -> Result<()> {
             _ => "127.0.0.1".to_string(),
         }
     };
-    println!("Bind: {}", bind_ip);
+    println!("Bind: {bind_ip}");
 
     let mut config = if config_exists() {
         load_config()?
@@ -92,7 +93,7 @@ pub async fn cmd_init() -> Result<()> {
                 config.active_model = Some(model_key.clone());
                 first_model = false;
             }
-            println!("Added model '{}' ({})", model_key, model_id);
+            println!("Added model '{model_key}' ({model_id})");
         } else {
             println!("Skipping model for {}.", kp.display_name);
         }
@@ -128,7 +129,7 @@ pub async fn cmd_init() -> Result<()> {
     let answer = ask("Add a device now? [Y/n]: ")?;
     if !answer.to_lowercase().starts_with('n') {
         let mut store = crate::config::load_devices()?;
-        cmd_onboard(&mut config, &mut store)?;
+        cmd_onboard(&config, &mut store)?;
     }
 
     // Summary

@@ -15,11 +15,11 @@ pub enum AuthFailure {
 }
 
 impl AuthFailure {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            AuthFailure::Revoked => "device_revoked",
-            AuthFailure::InvalidToken => "device_token_invalid",
-            AuthFailure::NeedsPairing => "device_token_missing",
+            Self::Revoked => "device_revoked",
+            Self::InvalidToken => "device_token_invalid",
+            Self::NeedsPairing => "device_token_missing",
         }
     }
 }
@@ -38,14 +38,6 @@ pub enum AuthMethod {
     DeviceToken,
 }
 
-/// Constant-time byte comparison (prevents timing attacks)
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    constant_time_eq::constant_time_eq(a, b)
-}
-
 /// Check if an IP address is a loopback address
 pub fn is_loopback(addr: &str) -> bool {
     addr == "127.0.0.1"
@@ -58,7 +50,7 @@ pub fn is_loopback(addr: &str) -> bool {
 /// Validate a token against device store
 fn validate_device_token(device_store: &DeviceStore, provided_token: &str) -> AuthResult {
     for device in device_store.devices.values() {
-        if constant_time_eq(device.token.as_bytes(), provided_token.as_bytes()) {
+        if constant_time_eq::constant_time_eq(device.token.as_bytes(), provided_token.as_bytes()) {
             if device.revoked {
                 tracing::warn!(device = %device.display_name, "Auth failed: device revoked");
                 return AuthResult::Failed(AuthFailure::Revoked);

@@ -1,5 +1,8 @@
 //! rabb1tClaw - Minimal Rust LLM gateway for Rabbit R1 and other devices.
 
+// Binary crate — all pub(crate) is inherently redundant (no external consumers)
+#![allow(clippy::redundant_pub_crate)]
+
 mod agent;
 mod cli;
 mod config;

@@ -11,7 +11,7 @@
 
 rabb1tClaw implements the [OpenClaw](https://github.com/openclaw/openclaw) WebSocket protocol v3, giving your R1 a direct line to OpenAI, Anthropic, DeepInfra, or any OpenAI-compatible endpoint. Built on async Rust (Tokio + Axum), it handles hundreds of concurrent device connections with streaming responses that start arriving on the first token. Runs comfortably on a Raspberry Pi.
 
-38 Rust source files. ~7k lines. That's the whole thing.
+43 Rust source files. 7,536 lines. That's the whole thing.
 
 <br clear="both">
 
@@ -19,10 +19,11 @@ rabb1tClaw implements the [OpenClaw](https://github.com/openclaw/openclaw) WebSo
 
 Everything here was designed for the Rabbit R1 first -- a voice-first device with a small screen and no keyboard. There's no room for "Searching..." spinners, tool-call confirmations, or multi-step UI flows. You talk to it. It talks back. That's the interface.
 
-The main conversation loop is the first-class citizen. The LLM streams its response directly to the device, word by word. When it decides it needs to run code or search the web, it emits lightweight markers inline. rabb1tClaw intercepts these in real-time, strips them from the stream so the device never sees them, and dispatches concurrent background agents:
+The main conversation loop is the first-class citizen. The LLM streams its response directly to the device, word by word. When it decides it needs to run code, search the web, or delegate complex multi-step tasks, it emits dispatch blocks inline. rabb1tClaw intercepts these in real-time, strips them from the stream so the device never sees them, and dispatches concurrent background agents:
 
 - **Code agent** -- sandboxed Python execution (Linux namespaces via hakoniwa), self-healing retry loop, persistent per-device workspace
-- **Search agent** -- 3-phase LLM-powered web search via [Serper.dev](https://serper.dev) (query analysis, evaluate, deep-read + synthesize)
+- **Search agent** -- 5-phase LLM-powered web search via [Serper.dev](https://serper.dev) (query analysis, multi-type fetch, page enrichment, context assembly, synthesis)
+- **Advanced agent** -- LLM orchestrator that plans and delegates to code/search agents for complex tasks, can ask user questions mid-task
 - **Memory agent** -- extracts facts worth remembering, persists them to disk, injects them into future conversations
 
 The main loop always knows what's running. On the next user message, completed results are injected into the system prompt and the LLM weaves them into its response naturally. No tool-use UI, no status indicators, no interruptions. The conversation just flows -- exactly how a voice-first device should work.
@@ -67,8 +68,10 @@ All config lives under `~/.rabb1tclaw/` with `0600` permissions:
 |------|---------|
 | `config.yaml` | Gateway, providers, models, agents, active model |
 | `devices.yaml` | Paired device tokens |
-| `<token_prefix>/session/` | Encrypted conversation sessions and memory |
+| `<token_prefix>/conversation.enc` | Encrypted conversation session (AES-256-GCM) |
+| `<token_prefix>/memory.md` | Persistent session memory |
 | `<token_prefix>/workspace/` | Persistent code agent workspace + venv |
+| `<token_prefix>/advanced_*.log` | Advanced task execution logs |
 
 Models are configured separately from providers, referencing a provider by key:
 
@@ -108,6 +111,7 @@ rabb1tclaw server --stop              Stop running server
 rabb1tclaw server --restart           Hot-reload config (SIGHUP)
 rabb1tclaw server --get-ip            Print current bind IP
 rabb1tclaw server --set-ip <IP>       Change bind IP
+rabb1tclaw server --debug             Enable debug + protocol dump logging
 ```
 
 ### Devices
@@ -158,6 +162,23 @@ The server watches config files every 2 seconds. Edit them and changes apply liv
 ---
 
 ## Changelog
+
+### v0.3.1
+
+**Advanced agent, dispatch format rewrite, and protocol hardening.**
+
+- **Advanced agent** -- LLM orchestrator for complex multi-step tasks. Plans a numbered strategy, then delegates to code and search agents one step at a time, observing results between each. Can ask the user questions mid-task via the main agent relay (question/answer flow through dispatch blocks). Auto-compresses its own context when messages exceed 80K characters. Logs every step to per-task log files. Code subtasks get injected API keys via sandbox env vars (never through LLM context). Configurable step limit (20), total timeout (900s), and independent code subtask limits (8 iterations, 300s timeout).
+- **Search agent overhaul** -- rewritten from 3-phase to 5-phase pipeline. Phase 1: LLM query analysis with locale, language, and time filters. Phase 2: multi-type Serper fetch (web all-time + past-day + news) with URL deduplication. Phase 3: parallel page enrichment via trafilatura content extraction. Phase 4: token-budgeted context assembly. Phase 5: LLM synthesis with sources. Depth-adaptive token budgets (quick: 16K, thorough: 32K).
+- **Strict dispatch blocks** -- replaced fragile HTML comment markers (`<!--code_task:-->`, `<!--web_search:-->`) with `@@dispatch` / `@@end` JSON blocks. Content is a serde-validated JSON array. No more false splits from `-->` appearing in natural text. Unclosed blocks pass through safely.
+- **Unified status injection** -- single `@@status` / `@@end` block replaces per-agent HTML comment status injections. All task types (code, search, advanced) in one JSON array with consistent fields (id, type, status, desc, and type-specific extras).
+- **Streaming dispatch filter** -- `MarkerFilter` rewritten for the new `@@dispatch` / `@@end` format. Prefix-safe emission prevents partial marker leaks. Eating mode swallows entire blocks including boundary newlines.
+- **OpenClaw protocol compliance** -- chat error event field corrected from `"error"` to `"errorMessage"` per OpenClaw spec. Full compatibility audit against upstream TypeBox schemas.
+- **Protocol documentation** -- new `docs/protocol/protocol_rabb1tclaw.md` with complete frame specs, event sequences, and differences table. Reference `docs/protocol/protocol_openclaw.md` synthesized from upstream source.
+- **Debug logging** -- `--debug` flag enables `debug.log` (full trace) + `protocoldump.log` (raw WebSocket frames) under `~/.rabb1tclaw/`.
+- **Cleaner injections** -- awareness uses plain text (`Current time: ...`), memory uses markdown heading (`## Session Memory`). No HTML comments anywhere in the system.
+- **System prompt rewrite** -- tighter dispatch instructions, better routing examples, consistent formatting across all 6 prompt files.
+- **Per-device connection tracking** -- active connections registered by device token. Revocation disconnects all sessions for that device immediately.
+- **Agent-level model overrides** -- extended to include the advanced agent. Each agent kind (main, code, memory, search, advanced) can target a different model with independent parameter tuning.
 
 ### v0.2.0
 

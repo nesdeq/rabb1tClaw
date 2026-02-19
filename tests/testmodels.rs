@@ -6,7 +6,7 @@
 //! Each test sends a minimal prompt and prints:
 //!   - HTTP status
 //!   - Full first SSE data line (raw JSON) to inspect field structure
-//!   - Whether reasoning_content / thinking fields appear
+//!   - Whether `reasoning_content` / thinking fields appear
 //!   - Any errors from unsupported params
 
 use reqwest::Client;
@@ -20,10 +20,8 @@ fn load_test_config() -> Value {
     // Load .env from project root
     let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
     if env_path.exists() {
-        for item in dotenvy::from_path_iter(&env_path).expect("Failed to read .env") {
-            if let Ok((k, v)) = item {
-                std::env::set_var(&k, &v);
-            }
+        for (k, v) in dotenvy::from_path_iter(&env_path).expect("Failed to read .env").flatten() {
+            std::env::set_var(&k, &v);
         }
     }
 
@@ -80,22 +78,19 @@ async fn post_chat(
     api_type: &str,
     body: &Value,
 ) -> (u16, String) {
-    let req = match api_type {
-        "anthropic" => {
-            let url = format!("{}/messages", base_url);
-            client
-                .post(&url)
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("Content-Type", "application/json")
-        }
-        _ => {
-            let url = format!("{}/chat/completions", base_url);
-            client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-        }
+    let req = if api_type == "anthropic" {
+        let url = format!("{base_url}/messages");
+        client
+            .post(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+    } else {
+        let url = format!("{base_url}/chat/completions");
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
     };
 
     let resp = req.json(body).send().await.expect("HTTP request failed");
@@ -105,6 +100,7 @@ async fn post_chat(
 }
 
 /// Send a streaming request, collect first N SSE data lines, return (status, lines).
+#[allow(clippy::items_after_statements)] // use import placed near its usage for readability
 async fn post_chat_stream(
     client: &Client,
     base_url: &str,
@@ -113,22 +109,19 @@ async fn post_chat_stream(
     body: &Value,
     max_lines: usize,
 ) -> (u16, Vec<String>) {
-    let req = match api_type {
-        "anthropic" => {
-            let url = format!("{}/messages", base_url);
-            client
-                .post(&url)
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("Content-Type", "application/json")
-        }
-        _ => {
-            let url = format!("{}/chat/completions", base_url);
-            client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-        }
+    let req = if api_type == "anthropic" {
+        let url = format!("{base_url}/messages");
+        client
+            .post(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+    } else {
+        let url = format!("{base_url}/chat/completions");
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
     };
 
     let resp = req.json(body).send().await.expect("HTTP request failed");
@@ -170,13 +163,13 @@ async fn post_chat_stream(
 
 fn print_header(label: &str) {
     println!("\n{}", "=".repeat(72));
-    println!("  {}", label);
+    println!("  {label}");
     println!("{}", "=".repeat(72));
 }
 
 fn print_test(label: &str, status: u16, body: &str) {
-    let ok = if status >= 200 && status < 300 { "OK" } else { "FAIL" };
-    println!("\n--- {} [{}] {} ---", label, status, ok);
+    let ok = if (200..300).contains(&status) { "OK" } else { "FAIL" };
+    println!("\n--- {label} [{status}] {ok} ---");
 
     // Pretty-print truncated JSON
     if let Ok(v) = serde_json::from_str::<Value>(body) {
@@ -185,17 +178,17 @@ fn print_test(label: &str, status: u16, body: &str) {
         if pretty.len() > 600 {
             println!("{}\n  ... (truncated, {} bytes total)", &pretty[..600], pretty.len());
         } else {
-            println!("{}", pretty);
+            println!("{pretty}");
         }
     } else {
         let truncated = if body.len() > 400 { &body[..400] } else { body };
-        println!("{}", truncated);
+        println!("{truncated}");
     }
 }
 
 fn print_stream_test(label: &str, status: u16, lines: &[String]) {
-    let ok = if status >= 200 && status < 300 { "OK" } else { "FAIL" };
-    println!("\n--- {} (stream) [{}] {} ---", label, status, ok);
+    let ok = if (200..300).contains(&status) { "OK" } else { "FAIL" };
+    println!("\n--- {label} (stream) [{status}] {ok} ---");
 
     if status >= 400 {
         for line in lines {
@@ -214,7 +207,7 @@ fn print_stream_test(label: &str, status: u16, lines: &[String]) {
 
     for (i, line) in lines.iter().enumerate() {
         if line == "[DONE]" {
-            println!("  [{}] [DONE]", i);
+            println!("  [{i}] [DONE]");
             continue;
         }
         if let Ok(v) = serde_json::from_str::<Value>(line) {
@@ -282,11 +275,11 @@ fn print_stream_test(label: &str, status: u16, lines: &[String]) {
     }
 
     println!("\n  Collected {} SSE data lines", lines.len());
-    println!("  has delta.content:           {}", has_content);
-    println!("  has delta.reasoning_content: {}", has_reasoning_content);
-    println!("  has delta.reasoning:         {}", has_reasoning);
-    println!("  has <think> tags in content: {}", has_think_tag);
-    println!("  has Anthropic thinking block:{}", has_thinking_block);
+    println!("  has delta.content:           {has_content}");
+    println!("  has delta.reasoning_content: {has_reasoning_content}");
+    println!("  has delta.reasoning:         {has_reasoning}");
+    println!("  has <think> tags in content: {has_think_tag}");
+    println!("  has Anthropic thinking block:{has_thinking_block}");
     if !content_sample.is_empty() {
         println!("  content sample: {:?}", &content_sample[..content_sample.len().min(80)]);
     }
@@ -302,7 +295,7 @@ const PROMPT: &str = "What is 25 * 37? Reply with just the number.";
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn anthropic_sonnet_baseline() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "anthropic");
@@ -323,7 +316,7 @@ async fn anthropic_sonnet_baseline() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn anthropic_sonnet_thinking() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "anthropic");
@@ -344,7 +337,7 @@ async fn anthropic_sonnet_thinking() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn anthropic_sonnet_unsupported_params() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "anthropic");
@@ -383,7 +376,7 @@ async fn anthropic_sonnet_unsupported_params() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn openai_gpt4o_baseline() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "openai");
@@ -410,7 +403,7 @@ async fn openai_gpt4o_baseline() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn openai_gpt4o_reasoning_params() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "openai");
@@ -447,7 +440,7 @@ async fn openai_gpt4o_reasoning_params() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn openai_gpt52_baseline() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "openai");
@@ -470,7 +463,7 @@ async fn openai_gpt52_baseline() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn openai_gpt52_reasoning_effort() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "openai");
@@ -488,12 +481,12 @@ async fn openai_gpt52_reasoning_effort() {
         });
 
         let (status, lines) = post_chat_stream(&client, &base_url, &api_key, "openai", &body, 20).await;
-        print_stream_test(&format!("reasoning_effort={}", effort), status, &lines);
+        print_stream_test(&format!("reasoning_effort={effort}"), status, &lines);
     }
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn openai_gpt52_unsupported_params() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "openai");
@@ -530,7 +523,7 @@ async fn openai_gpt52_unsupported_params() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn deepinfra_kimi_k25_baseline() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "deepinfra");
@@ -555,7 +548,7 @@ async fn deepinfra_kimi_k25_baseline() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn deepinfra_kimi_k25_all_params() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "deepinfra");
@@ -579,7 +572,7 @@ async fn deepinfra_kimi_k25_all_params() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn deepinfra_kimi_k25_reasoning_params() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "deepinfra");
@@ -612,7 +605,7 @@ async fn deepinfra_kimi_k25_reasoning_params() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn deepinfra_kimi_k25_thinking_toggle() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "deepinfra");
@@ -654,7 +647,9 @@ async fn deepinfra_kimi_k25_thinking_toggle() {
     });
 
     let (status, lines) = post_chat_stream(&client, &base_url, &api_key, "openai", &body, 40).await;
-    print_stream_test("thinking={type:enabled}", status, &lines);
+    #[allow(clippy::literal_string_with_formatting_args)]
+    let label = "thinking={type:enabled}";
+    print_stream_test(label, status, &lines);
 }
 
 // ============================================================================
@@ -662,7 +657,7 @@ async fn deepinfra_kimi_k25_thinking_toggle() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn deepinfra_thinking_levels_probe() {
     let config = load_test_config();
     let (base_url, api_key) = get_provider(&config, "deepinfra");
@@ -681,7 +676,7 @@ async fn deepinfra_thinking_levels_probe() {
             "stream": true,
         });
         let (status, lines) = post_chat_stream(&client, &base_url, &api_key, "openai", &body, 60).await;
-        print_stream_test(&format!("reasoning_effort={} + thinking=true", effort), status, &lines);
+        print_stream_test(&format!("reasoning_effort={effort} + thinking=true"), status, &lines);
     }
 
     // 2. reasoning_effort alone (no chat_template_kwargs)
@@ -694,7 +689,7 @@ async fn deepinfra_thinking_levels_probe() {
             "stream": true,
         });
         let (status, lines) = post_chat_stream(&client, &base_url, &api_key, "openai", &body, 60).await;
-        print_stream_test(&format!("reasoning_effort={} (no kwargs)", effort), status, &lines);
+        print_stream_test(&format!("reasoning_effort={effort} (no kwargs)"), status, &lines);
     }
 
     // 3. thinking_budget in chat_template_kwargs
@@ -707,7 +702,7 @@ async fn deepinfra_thinking_levels_probe() {
             "stream": true,
         });
         let (status, lines) = post_chat_stream(&client, &base_url, &api_key, "openai", &body, 80).await;
-        print_stream_test(&format!("thinking_budget={}", budget), status, &lines);
+        print_stream_test(&format!("thinking_budget={budget}"), status, &lines);
     }
 
     // 4. max_thinking_tokens (top-level, like some providers do)
@@ -721,7 +716,7 @@ async fn deepinfra_thinking_levels_probe() {
             "stream": true,
         });
         let (status, lines) = post_chat_stream(&client, &base_url, &api_key, "openai", &body, 80).await;
-        print_stream_test(&format!("max_thinking_tokens={}", tokens), status, &lines);
+        print_stream_test(&format!("max_thinking_tokens={tokens}"), status, &lines);
     }
 
     // 5. budget_tokens in chat_template_kwargs
@@ -745,7 +740,7 @@ async fn deepinfra_thinking_levels_probe() {
             "stream": true,
         });
         let (status, lines) = post_chat_stream(&client, &base_url, &api_key, "openai", &body, 60).await;
-        print_stream_test(&format!("enable_thinking=\"{}\"", val), status, &lines);
+        print_stream_test(&format!("enable_thinking=\"{val}\""), status, &lines);
     }
 
     // 7. thinking object (Anthropic-style) at top level
@@ -776,7 +771,7 @@ async fn deepinfra_thinking_levels_probe() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live API keys"]
 async fn all_models_probe() {
     let config = load_test_config();
     let client = Client::new();
@@ -789,7 +784,7 @@ async fn all_models_probe() {
     if let Some(p) = config["providers"].as_object() {
         println!("Configured providers:");
         for k in p.keys() {
-            println!("  - {}", k);
+            println!("  - {k}");
         }
     }
 

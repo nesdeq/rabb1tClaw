@@ -83,31 +83,66 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         None => {
-            init_logging();
-            server::cmd_server_start().await
+            init_logging(false);
+            server::cmd_server_start(false).await
         }
         Some(Command::Init) => init::cmd_init().await,
         Some(Command::Server(args)) => server::dispatch(args).await,
-        Some(Command::Devices(args)) => devices::dispatch(args),
-        Some(Command::Providers(args)) => providers::dispatch(args).await,
+        Some(Command::Devices(ref args)) => devices::dispatch(args),
+        Some(Command::Providers(ref args)) => providers::dispatch(args),
         Some(Command::Models(args)) => models::dispatch(args).await,
     }
 }
 
-pub(crate) fn init_logging() {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+pub(crate) fn init_logging(debug: bool) {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+
+    let info_filter = || tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "rabb1tclaw=info".into());
+
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .compact()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_filter(info_filter());
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("rabb1tclaw.log")
+        .expect("Failed to open rabb1tclaw.log");
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .compact()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_filter(info_filter());
+
+    let debug_layer = if debug {
+        let debug_path = crate::config::config_dir().join("debug.log");
+        let debug_file = std::fs::File::create(&debug_path)
+            .expect("Failed to create debug.log");
+        let debug_filter: tracing_subscriber::EnvFilter = "rabb1tclaw=debug".into();
+        Some(tracing_subscriber::fmt::layer()
+            .compact()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(debug_file))
+            .with_filter(debug_filter))
+    } else {
+        None
+    };
+
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "rabb1tclaw=info".into()),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .compact()
-                .with_target(false)
-                .with_thread_ids(false)
-                .with_thread_names(false),
-        )
+        .with(stdout_layer)
+        .with(file_layer)
+        .with(debug_layer)
         .init();
 }
 
@@ -133,7 +168,7 @@ pub(crate) fn mask_key(key: &str) -> String {
 
 /// Print a prompt, flush stdout, and read a line from stdin (trimmed)
 pub(crate) fn ask(prompt: &str) -> Result<String> {
-    print!("{}", prompt);
+    print!("{prompt}");
     io::stdout().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
@@ -165,12 +200,10 @@ pub(crate) fn discover_api_keys() -> Vec<(&'static KnownProvider, String)> {
     let env_path = binary_env_path();
 
     if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
-        for item in iter {
-            if let Ok((k, v)) = item {
-                for kp in KNOWN_PROVIDERS {
-                    if k == kp.env_var && !v.is_empty() {
-                        found.push((kp, v.clone()));
-                    }
+        for (k, v) in iter.flatten() {
+            for kp in KNOWN_PROVIDERS {
+                if k == kp.env_var && !v.is_empty() {
+                    found.push((kp, v.clone()));
                 }
             }
         }
@@ -212,7 +245,7 @@ pub(crate) async fn pick_model(api_type: &str, base_url: &str, api_key: &str, sk
             for (i, m) in models.iter().enumerate() {
                 println!("  {:>3}) {}", i + 1, m.id);
             }
-            println!("    0) {}", skip_label);
+            println!("    0) {skip_label}");
 
             let choice = ask("\nPick a model [1]: ").ok()?;
             let idx: usize = choice.parse().unwrap_or(1);
@@ -229,7 +262,7 @@ pub(crate) async fn pick_model(api_type: &str, base_url: &str, api_key: &str, sk
             Some(model_id)
         }
         Err(e) => {
-            println!("Failed to list models: {}", e);
+            println!("Failed to list models: {e}");
             None
         }
     }
@@ -284,28 +317,24 @@ pub(crate) fn print_quick_reference() {
 /// Returns Ok if PID file found, prints appropriate message.
 #[cfg(unix)]
 pub(crate) fn send_signal_to_server(signal: &str, signal_name: &str) -> Result<()> {
-    match crate::config::read_pid_file() {
-        Some(pid) => {
-            let mut args = vec![pid.to_string()];
-            if !signal.is_empty() {
-                args.insert(0, signal.to_string());
-            }
-            let status = std::process::Command::new("kill")
-                .args(&args)
-                .status()
-                .with_context(|| format!("Failed to send {}", signal_name))?;
-            if status.success() {
-                println!("Sent {} to server (PID {})", signal_name, pid);
-            } else {
-                eprintln!("Failed to signal PID {} (process may have exited)", pid);
-            }
-            Ok(())
+    if let Some(pid) = crate::config::read_pid_file() {
+        let mut args = vec![pid.to_string()];
+        if !signal.is_empty() {
+            args.insert(0, signal.to_string());
         }
-        None => {
-            println!("No running server found (no PID file).");
-            Ok(())
+        let status = std::process::Command::new("kill")
+            .args(&args)
+            .status()
+            .with_context(|| format!("Failed to send {signal_name}"))?;
+        if status.success() {
+            println!("Sent {signal_name} to server (PID {pid})");
+        } else {
+            eprintln!("Failed to signal PID {pid} (process may have exited)");
         }
+    } else {
+        println!("No running server found (no PID file).");
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]

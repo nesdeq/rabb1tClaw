@@ -4,7 +4,11 @@ use super::auth::{authorize_connect, is_loopback, AuthFailure, AuthResult};
 use super::server::ServerState;
 use crate::agent::dispatch_method;
 use crate::config::{config_dir, config_path};
-use crate::protocol::{now_ms, *};
+use crate::protocol::{
+    now_ms, AuthInfo, ConnectParams, ErrorShape, EventFrame, Features, HelloOk,
+    IncomingFrame, OutgoingFrame, Policy, ResponseFrame, ServerInfo, Snapshot,
+    PROTOCOL_VERSION,
+};
 use crate::state::HandlerContext;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -16,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
+#[allow(clippy::too_many_lines)]
 pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, client_ip: String) {
     let conn_id = crate::protocol::short_id();
     let is_local = is_loopback(&client_ip);
@@ -27,23 +32,28 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, client_ip
     let (tx, mut rx) = mpsc::channel::<OutgoingFrame>(crate::protocol::STREAM_CHANNEL_CAPACITY);
 
     // Spawn task to forward outgoing messages
+    let debug_log = state.gateway.debug_log.clone();
+    let send_conn_id = conn_id.clone();
     let send_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            if let OutgoingFrame::Close { code, reason } = frame {
-                let _ = sender.send(Message::Close(Some(CloseFrame {
-                    code: code.into(),
-                    reason: reason.into(),
-                }))).await;
-                break;
-            }
-
-            match serde_json::to_string(&frame) {
-                Ok(json) => {
-                    if sender.send(Message::Text(json.into())).await.is_err() {
-                        break;
-                    }
+            match frame {
+                OutgoingFrame::Close { code, reason } => {
+                    log_outgoing(debug_log.as_ref(), &send_conn_id, &format!("CLOSE {code} {reason}"));
+                    let _ = sender.send(Message::Close(Some(CloseFrame {
+                        code,
+                        reason: reason.into(),
+                    }))).await;
+                    break;
                 }
-                Err(e) => error!("Failed to serialize frame: {}", e),
+                frame => match serde_json::to_string(&frame) {
+                    Ok(json) => {
+                        log_outgoing(debug_log.as_ref(), &send_conn_id, &json);
+                        if sender.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => error!("Failed to serialize frame: {}", e),
+                },
             }
         }
     });
@@ -54,6 +64,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, client_ip
     let challenge_event = EventFrame::new("connect.challenge")
         .with_payload(json!({ "nonce": uuid::Uuid::new_v4().to_string(), "ts": now_ms() }));
     let _ = tx.send(OutgoingFrame::Event(challenge_event)).await;
+    state.gateway.log_frame(&conn_id, "---", &format!("connected from {client_ip}"));
     debug!(conn_id = %conn_id, "Sent connect.challenge");
 
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -63,7 +74,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, client_ip
     loop {
         let msg = tokio::select! {
             msg = receiver.next() => msg,
-            _ = shutdown_notify_clone.notified() => {
+            () = shutdown_notify_clone.notified() => {
                 info!(conn_id = %conn_id, "Shutdown signal received");
                 break;
             }
@@ -80,13 +91,14 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, client_ip
 
         match msg {
             Message::Text(text) => {
+                state.gateway.log_frame(&conn_id, "IN ", text.as_ref());
                 let frame: IncomingFrame = match serde_json::from_str(text.as_ref()) {
                     Ok(f) => f,
                     Err(e) => {
-                        warn!(conn_id = %conn_id, "Parse error: {}", e);
+                        debug!(conn_id = %conn_id, "Parse error: {}", e);
                         let error = ResponseFrame::error(
                             "unknown".to_string(),
-                            ErrorShape::invalid_request(format!("failed to parse frame: {}", e)),
+                            ErrorShape::invalid_request(format!("failed to parse frame: {e}")),
                         );
                         let _ = tx.send(OutgoingFrame::Response(error)).await;
                         continue;
@@ -101,7 +113,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, client_ip
                             authenticated_token = token;
                             connected = true;
                         }
-                        ConnectOutcome::NeedsPairing => continue,
+                        ConnectOutcome::NeedsPairing => {}
                         ConnectOutcome::Rejected => {
                             let _ = tx.send(OutgoingFrame::Close {
                                 code: 1008,
@@ -148,7 +160,10 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, client_ip
         state.gateway.unregister_connection(token, &conn_id).await;
     }
 
-    info!(conn_id = %conn_id, "Disconnected");
+    state.gateway.log_frame(&conn_id, "---", "disconnected");
+    let disc_prefix = authenticated_token.as_ref()
+        .map_or_else(|| conn_id.clone(), |t| crate::agent::session::token_prefix(t));
+    info!("[{}] disconnected", disc_prefix);
 }
 
 // ============================================================================
@@ -161,6 +176,7 @@ enum ConnectOutcome {
     Rejected,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connect(
     state: &Arc<ServerState>,
     conn_id: &str,
@@ -182,9 +198,10 @@ async fn handle_connect(
 
     match auth_result {
         AuthResult::Ok(method) => {
-            info!(conn_id = %conn_id, method = ?method, "Connected");
-
             let device_token = connect_auth.and_then(|a| a.token.clone());
+            let prefix = device_token.as_ref()
+                .map_or_else(|| conn_id.to_string(), |t| crate::agent::session::token_prefix(t));
+            info!("[{}] connected method={:?}", prefix, method);
 
             // Register connection for revocation tracking
             if let Some(ref token) = device_token {
@@ -213,7 +230,7 @@ async fn handle_connect(
             let reason = failure.as_str();
             warn!(conn_id = %conn_id, reason = %reason, "Auth failed");
 
-            let error = ErrorShape::invalid_request(format!("unauthorized: {}", reason));
+            let error = ErrorShape::invalid_request(format!("unauthorized: {reason}"));
             let _ = tx.send(OutgoingFrame::Response(
                 ResponseFrame::error(request_id.to_string(), error),
             )).await;
@@ -254,6 +271,16 @@ fn spawn_tick_task(tx: mpsc::Sender<OutgoingFrame>, conn_id: String, shutdown: A
 }
 
 // ============================================================================
+// Debug logging
+// ============================================================================
+
+fn log_outgoing(debug_log: Option<&crate::state::DebugLog>, conn_id: &str, msg: &str) {
+    if let Some(log) = debug_log {
+        crate::state::write_debug_line(log, "OUT", conn_id, msg);
+    }
+}
+
+// ============================================================================
 // Hello-OK Response
 // ============================================================================
 
@@ -268,29 +295,16 @@ fn create_hello_ok(
         protocol: PROTOCOL_VERSION,
         server: ServerInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            commit: None,
-            host: None,
             conn_id,
         },
-        features: Features::default_features(),
+        features: Features::default(),
         snapshot: Snapshot {
-            presence: vec![],
-            health: json!({}),
-            state_version: StateVersion::default(),
-            uptime_ms: 0,
             config_path: Some(config_path),
             state_dir: Some(state_dir),
-            session_defaults: Some(SessionDefaults {
-                default_agent_id: "default".to_string(),
-                main_key: "main".to_string(),
-                main_session_key: "default:main".to_string(),
-            }),
         },
         policy: Policy::default(),
         auth: device_token.map(|token| AuthInfo {
             device_token: token,
-            role: "operator".to_string(),
-            scopes: vec!["operator.admin".to_string()],
             issued_at_ms: Some(now_ms()),
         }),
     }

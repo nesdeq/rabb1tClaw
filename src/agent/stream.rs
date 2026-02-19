@@ -1,9 +1,8 @@
 //! Think-block stripping, streaming marker filtering, and stream collection.
 //!
-//! Reasoning models (Kimi, DeepSeek R1, QwQ, etc.) may emit `<think>…</think>`
-//! blocks at the start of their output.  The main agent also emits HTML-comment
-//! markers (`<!--code_task:…-->`, `<!--web_search:…-->`) that must be hidden
-//! from the device.
+//! Reasoning models (Kimi, `DeepSeek` R1, `QwQ`, etc.) may emit `<think>…</think>`
+//! blocks at the start of their output.  The main agent also emits
+//! `@@dispatch` blocks that must be hidden from the device.
 
 use crate::provider::StreamChunk;
 
@@ -24,17 +23,12 @@ pub(crate) fn check_think_block(buf: &str) -> ThinkResult {
         return ThinkResult::Pending;
     }
     if trimmed.starts_with("<think>") {
-        return match trimmed.find("</think>") {
-            Some(end) => {
-                let after = trimmed[end + 8..].trim_start().to_string();
-                ThinkResult::Stripped(after)
-            }
-            None => ThinkResult::Pending,
-        };
+        return trimmed.find("</think>").map_or(ThinkResult::Pending, |end| {
+            ThinkResult::Stripped(trimmed[end + 8..].trim_start().to_string())
+        });
     }
-    if trimmed.starts_with("</think>") {
-        let after = trimmed[8..].trim_start().to_string();
-        return ThinkResult::Stripped(after);
+    if let Some(after) = trimmed.strip_prefix("</think>") {
+        return ThinkResult::Stripped(after.trim_start().to_string());
     }
     if "<think>".starts_with(trimmed) || "</think>".starts_with(trimmed) {
         return ThinkResult::Pending;
@@ -43,33 +37,34 @@ pub(crate) fn check_think_block(buf: &str) -> ThinkResult {
 }
 
 /// Find the safe-to-emit length of `text`, excluding any trailing bytes
-/// that could be the start of a `<!--code_task:` or `<!--web_search:` marker.
+/// that could be the start of a `\n@@dispatch\n` or `@@dispatch\n` marker.
 fn safe_emit_end(text: &str) -> usize {
-    const MARKERS: &[&[u8]] = &[b"<!--code_task:", b"<!--web_search:"];
+    // Ordered longest-first: "\n@@dispatch\n" always gives the most conservative
+    // (smallest) hold-back, so matching it first and returning immediately is correct.
+    const MARKERS: &[&[u8]] = &[b"\n@@dispatch\n", b"@@dispatch\n"];
     let bytes = text.as_bytes();
-    let mut safe = bytes.len();
+
     for marker in MARKERS {
         let max_check = marker.len().min(bytes.len());
         for len in (1..=max_check).rev() {
             let start = bytes.len() - len;
             if marker.starts_with(&bytes[start..]) {
-                safe = safe.min(start);
-                break;
+                return start;
             }
         }
     }
-    safe
+    bytes.len()
 }
 
-/// Filters `<!--code_task:...-->` and `<!--web_search:...-->` markers out of
-/// the streaming delta window so they never reach the device.
+/// Filters `@@dispatch ... @@end` blocks out of the streaming delta window
+/// so they never reach the device.
 pub(crate) struct MarkerFilter {
     committed: usize,
     eating: bool,
 }
 
 impl MarkerFilter {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { committed: 0, eating: false }
     }
 
@@ -82,24 +77,29 @@ impl MarkerFilter {
             if remaining.is_empty() { break; }
 
             if self.eating {
-                if let Some(end) = remaining.find("-->") {
-                    self.committed += end + 3;
+                // Look for \n@@end at end of block, or \n@@end\n mid-response
+                if let Some(pos) = remaining.find("\n@@end") {
+                    let end_tag_len = "\n@@end".len();
+                    let block_end = pos + end_tag_len;
+                    // Skip trailing newline if present
+                    if block_end < remaining.len() && remaining.as_bytes()[block_end] == b'\n' {
+                        self.committed += block_end + 1;
+                    } else {
+                        self.committed += block_end;
+                    }
                     self.eating = false;
                     continue;
                 }
+                // Not found yet — wait for more data
                 break;
             }
 
-            let earliest = [
-                remaining.find("<!--code_task:"),
-                remaining.find("<!--web_search:"),
-            ].into_iter().flatten().min();
-
-            if let Some(start) = earliest {
-                if start > 0 {
-                    deltas.push(&remaining[..start]);
+            // Look for @@dispatch\n (preceded by \n or at start)
+            if let Some(pos) = find_dispatch_start(remaining) {
+                if pos > 0 {
+                    deltas.push(&remaining[..pos]);
                 }
-                self.committed += start;
+                self.committed += pos;
                 self.eating = true;
                 continue;
             }
@@ -116,7 +116,11 @@ impl MarkerFilter {
 
     /// Flush any remaining buffered text (called on stream end).
     pub fn flush<'a>(&mut self, full_response: &'a str) -> Option<&'a str> {
-        if !self.eating && self.committed < full_response.len() {
+        if self.eating {
+            // Suppress incomplete block
+            return None;
+        }
+        if self.committed < full_response.len() {
             let remaining = &full_response[self.committed..];
             if !remaining.is_empty() {
                 self.committed = full_response.len();
@@ -127,7 +131,27 @@ impl MarkerFilter {
     }
 }
 
-/// Drain an mpsc receiver of StreamChunks into a single string.
+/// Find the start of a `@@dispatch\n` marker in `text`, which must either
+/// be at position 0 or preceded by `\n`.
+fn find_dispatch_start(text: &str) -> Option<usize> {
+    let mut search_from = 0;
+    loop {
+        let pos = text[search_from..].find("@@dispatch\n")?;
+        let abs = search_from + pos;
+        if abs == 0 || text.as_bytes()[abs - 1] == b'\n' {
+            // Include the preceding \n in what we eat (so it doesn't leak)
+            return if abs > 0 && text.as_bytes()[abs - 1] == b'\n' {
+                Some(abs - 1)
+            } else {
+                Some(abs)
+            };
+        }
+        // False positive (e.g. "foo@@dispatch\n") — skip past
+        search_from = abs + 1;
+    }
+}
+
+/// Drain an mpsc receiver of `StreamChunk`s into a single string.
 pub(crate) async fn collect_stream(
     mut rx: tokio::sync::mpsc::Receiver<StreamChunk>,
 ) -> anyhow::Result<String> {
@@ -136,7 +160,7 @@ pub(crate) async fn collect_stream(
         match chunk {
             StreamChunk::Text(t) => buf.push_str(&t),
             StreamChunk::Done => break,
-            StreamChunk::Error(e) => return Err(anyhow::anyhow!("stream error: {}", e)),
+            StreamChunk::Error(e) => return Err(anyhow::anyhow!("stream error: {e}")),
         }
     }
     Ok(buf)

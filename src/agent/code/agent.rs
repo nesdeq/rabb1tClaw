@@ -1,10 +1,10 @@
 use crate::config::native::{AgentKind, CODE_AGENT_SYSTEM_PROMPT};
 use crate::provider::ChatMessage;
 use crate::state::GatewayState;
-use std::path::Path;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
+use super::helpers::{extract_packages, extract_python_code, list_workspace};
 use super::sandbox::{ensure_venv, execute_in_sandbox, pip_install, workspace_dir};
 use super::tracker::{CodeTaskStatus, CodeTaskTracker};
 use crate::agent::tracker::truncate;
@@ -14,80 +14,9 @@ fn read_limits(cfg: &crate::config::GatewayConfig) -> (u32, usize, u64) {
     let ac = cfg.agent_config(AgentKind::Code);
     let max_iterations = ac.and_then(|a| a.max_iterations).unwrap_or(crate::cli::defaults::DEFAULT_CODE_MAX_ITERATIONS);
     let max_output_tokens = ac.and_then(|a| a.max_output_tokens)
-        .or_else(|| ac.and_then(|a| a.max_output_chars)) // deprecated alias
         .unwrap_or(crate::cli::defaults::DEFAULT_CODE_MAX_OUTPUT_TOKENS);
     let exec_timeout_secs = ac.and_then(|a| a.exec_timeout_secs).unwrap_or(crate::cli::defaults::DEFAULT_CODE_EXEC_TIMEOUT_SECS);
     (max_iterations, max_output_tokens, exec_timeout_secs)
-}
-
-/// Extract the first ```python fenced code block from an LLM response.
-fn extract_python_code(response: &str) -> Option<String> {
-    let marker = "```python";
-    let start = response.find(marker)?;
-    let code_start = start + marker.len();
-    // Skip optional newline after marker
-    let code_start = if response[code_start..].starts_with('\n') {
-        code_start + 1
-    } else {
-        code_start
-    };
-    let end = response[code_start..].find("```")?;
-    let code = response[code_start..code_start + end].trim_end();
-    if code.is_empty() {
-        return None;
-    }
-    Some(code.to_string())
-}
-
-/// Extract package names from a ### Packages section.
-fn extract_packages(response: &str) -> Vec<String> {
-    // Look for ### Packages section, then a ``` block
-    let header = "### Packages";
-    let Some(idx) = response.find(header) else {
-        return Vec::new();
-    };
-    let after = &response[idx + header.len()..];
-
-    // Find the fenced block
-    let Some(fence_start) = after.find("```") else {
-        return Vec::new();
-    };
-    let inner_start = fence_start + 3;
-    // Skip optional language tag on the fence line
-    let inner_start = match after[inner_start..].find('\n') {
-        Some(nl) => inner_start + nl + 1,
-        None => return Vec::new(),
-    };
-    let Some(fence_end) = after[inner_start..].find("```") else {
-        return Vec::new();
-    };
-
-    let block = &after[inner_start..inner_start + fence_end];
-    block
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect()
-}
-
-/// List workspace contents (top-level only, for context).
-fn list_workspace(workspace: &Path) -> String {
-    let mut listing = String::new();
-    if let Ok(entries) = std::fs::read_dir(workspace) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name == ".venv" {
-                continue;
-            }
-            listing.push_str(&name.to_string_lossy());
-            listing.push('\n');
-        }
-    }
-    if listing.is_empty() {
-        "(empty)".to_string()
-    } else {
-        listing
-    }
 }
 
 /// Run a code agent: resolve model, self-healing loop, store result.
@@ -95,44 +24,64 @@ pub async fn run_agent(
     state: Arc<GatewayState>,
     tracker: Arc<CodeTaskTracker>,
     token: String,
-    task_id: String,
+    task_id: u32,
     description: String,
 ) {
     let prefix = crate::agent::session::token_prefix(&token);
 
-    info!("Code agent started: [{}] {}", task_id, description);
+    debug!("[CODE] [{}] Started: {}", task_id, description);
 
-    let result = run_inner(&state, &prefix, &task_id, &description).await;
+    let (max_iterations, max_output_tokens, exec_timeout_secs, env_vars) = {
+        let cfg = state.gateway_config.read().await;
+        let (mi, mo, et) = read_limits(&cfg);
+        let env = crate::agent::advanced::collect_api_env_vars(&cfg);
+        drop(cfg);
+        (mi, mo, et, env)
+    };
+    let task_log_max = crate::agent::tasklog::max_entries(&state).await;
+
+    let result = run_code_loop(
+        &state, &prefix, &format!("task_{task_id}"), &description,
+        &env_vars, max_iterations, exec_timeout_secs, max_output_tokens, true,
+    ).await;
 
     let status = match result {
         Ok((output, iterations)) => {
-            info!("Code agent [{}] completed in {} iterations", task_id, iterations);
-            CodeTaskStatus::Completed { output, iterations }
+            info!("[{}] [CODE] [{}] completed ({} iters)", prefix, task_id, iterations);
+            CodeTaskStatus::Completed { output }
         }
         Err((e, iterations)) => {
-            warn!("Code agent [{}] failed after {} iterations: {}", task_id, iterations, e);
-            CodeTaskStatus::Failed {
-                error: e.to_string(),
-                iterations,
-            }
+            info!("[{}] [CODE] [{}] failed ({} iters)", prefix, task_id, iterations);
+            debug!("[CODE] [{}] error: {}", task_id, e);
+            CodeTaskStatus::Failed { error: e.to_string() }
         }
     };
 
-    tracker.complete(&prefix, &task_id, status).await;
+    let event = match &status {
+        CodeTaskStatus::Completed { output } => format!("completed #{task_id} — {output}"),
+        CodeTaskStatus::Failed { error } => format!("failed #{task_id} — {error}"),
+        CodeTaskStatus::Running => unreachable!(),
+    };
+    tracker.complete(&prefix, task_id, status).await;
+    crate::agent::tasklog::append(&prefix, &event, task_log_max);
 }
 
-async fn run_inner(
+/// Shared code execution loop used by both the standalone code agent and the advanced agent.
+/// Resolves model, creates workspace+venv, runs the self-healing LLM->extract->execute loop.
+/// When `verify` is true, successful executions are validated by asking the LLM if the
+/// output satisfies the original task (standalone code agent behavior).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn run_code_loop(
     state: &Arc<GatewayState>,
     prefix: &str,
     task_id: &str,
     description: &str,
+    env_vars: &[(String, String)],
+    max_iterations: u32,
+    exec_timeout_secs: u64,
+    max_output_tokens: usize,
+    verify: bool,
 ) -> Result<(String, u32), (anyhow::Error, u32)> {
-    // Read operational limits from config
-    let (max_iterations, max_output_tokens, exec_timeout_secs) = {
-        let cfg = state.gateway_config.read().await;
-        read_limits(&cfg)
-    };
-
     // Resolve code agent model + provider
     let resolved = crate::agent::runner::resolve_agent_model(state, AgentKind::Code).await
         .ok_or_else(|| (anyhow::anyhow!("no active model configured"), 0))?;
@@ -158,16 +107,21 @@ async fn run_inner(
 
     let listing = list_workspace(&workspace);
 
+    // Build system prompt with env var awareness
+    let api_info = crate::agent::advanced::format_api_availability(env_vars);
+    let system_prompt = CODE_AGENT_SYSTEM_PROMPT.replace("{available_apis}", &api_info);
+
     let mut messages = vec![ChatMessage {
         role: "user".to_string(),
-        content: format!("Task: {}\n\nWorkspace contents:\n{}", description, listing),
+        content: format!("Task: {description}\n\nWorkspace contents:\n{listing}"),
     }];
 
     let mut last_error = String::new();
+    let script_name = format!("{task_id}.py");
 
     for iteration in 1..=max_iterations {
         // LLM call
-        let request = resolved.chat_request(messages.clone(), Some(CODE_AGENT_SYSTEM_PROMPT.to_string()));
+        let request = resolved.chat_request(messages.clone(), Some(system_prompt.clone()));
 
         let rx = match resolved.provider.chat_stream(request).await {
             Ok(rx) => rx,
@@ -184,7 +138,8 @@ async fn run_inner(
             let ws = workspace.clone();
             let pfx = python_prefix.clone();
             let eto = exec_timeout_secs;
-            let pip_result = tokio::task::spawn_blocking(move || pip_install(&ws, &pfx, &packages, eto)).await;
+            let evs: Vec<(String, String)> = env_vars.to_vec();
+            let pip_result = tokio::task::spawn_blocking(move || pip_install(&ws, &pfx, &packages, eto, &evs)).await;
             let (ok, pip_out) = match pip_result {
                 Err(e) => fail!(iteration, anyhow::anyhow!("join error: {}", e)),
                 Ok(Err(e)) => fail!(iteration, e),
@@ -220,7 +175,6 @@ async fn run_inner(
         };
 
         // Write script to workspace
-        let script_name = format!("task_{}.py", task_id);
         let script_path = workspace.join(&script_name);
         if let Err(e) = std::fs::write(&script_path, &code) {
             fail!(iteration, anyhow::anyhow!(e));
@@ -231,8 +185,9 @@ async fn run_inner(
         let pfx = python_prefix.clone();
         let sn = script_name.clone();
         let eto = exec_timeout_secs;
+        let evs: Vec<(String, String)> = env_vars.to_vec();
         let exec_result =
-            tokio::task::spawn_blocking(move || execute_in_sandbox(&ws, &pfx, &sn, eto)).await;
+            tokio::task::spawn_blocking(move || execute_in_sandbox(&ws, &pfx, &sn, eto, &evs)).await;
         let (ok, stdout, stderr) = match exec_result {
             Err(e) => fail!(iteration, anyhow::anyhow!("join error: {}", e)),
             Ok(Err(e)) => fail!(iteration, e),
@@ -246,17 +201,20 @@ async fn run_inner(
                 truncate(&stdout, max_output_tokens)
             };
 
+            if !verify {
+                return Ok((output, iteration));
+            }
+
             // Verify: ask LLM if results satisfy the original task
             let artifacts = list_workspace(&workspace);
             let verify_msg = format!(
                 "Execution succeeded.\n\n\
-                 **stdout:**\n{}\n\n\
-                 **Workspace files:**\n{}\n\n\
-                 **Original task:** {}\n\n\
+                 **stdout:**\n{output}\n\n\
+                 **Workspace files:**\n{artifacts}\n\n\
+                 **Original task:** {description}\n\n\
                  Does the output and any created files fully satisfy the task? \
                  If yes, respond with exactly `LGTM`. \
-                 If not, explain what's wrong and provide a fixed ```python block.",
-                output, artifacts, description
+                 If not, explain what's wrong and provide a fixed ```python block."
             );
 
             // On last iteration, accept whatever we got
@@ -273,15 +231,13 @@ async fn run_inner(
                 content: verify_msg,
             });
 
-            let verify_request = resolved.chat_request(messages.clone(), Some(CODE_AGENT_SYSTEM_PROMPT.to_string()));
+            let verify_request = resolved.chat_request(messages.clone(), Some(system_prompt.clone()));
 
-            let vrx = match resolved.provider.chat_stream(verify_request).await {
-                Ok(rx) => rx,
-                Err(_) => return Ok((output, iteration)),
+            let Ok(vrx) = resolved.provider.chat_stream(verify_request).await else {
+                return Ok((output, iteration));
             };
-            let verdict = match crate::agent::stream::collect_stream(vrx).await {
-                Ok(r) => r,
-                Err(_) => return Ok((output, iteration)),
+            let Ok(verdict) = crate::agent::stream::collect_stream(vrx).await else {
+                return Ok((output, iteration));
             };
 
             if verdict.trim().starts_with("LGTM") {
@@ -289,20 +245,21 @@ async fn run_inner(
             }
 
             // LLM says it's not right — check if it included a fix inline
-            info!("Code agent [{}] verification failed, retrying", task_id);
+            debug!("[CODE] [{}] Verification failed, retrying", task_id);
             last_error = "verification: result did not satisfy task".to_string();
 
             // If the verdict contains a code fix, extract and execute it
             // directly instead of burning another LLM call.
             if let Some(fix_code) = extract_python_code(&verdict) {
-                let sn = format!("task_{}.py", task_id);
-                let _ = std::fs::write(workspace.join(&sn), &fix_code);
+                let _ = std::fs::write(workspace.join(&script_name), &fix_code);
 
                 let ws = workspace.clone();
                 let pfx = python_prefix.clone();
+                let sn = script_name.clone();
                 let eto = exec_timeout_secs;
+                let evs: Vec<(String, String)> = env_vars.to_vec();
                 let fix_result =
-                    tokio::task::spawn_blocking(move || execute_in_sandbox(&ws, &pfx, &sn, eto)).await;
+                    tokio::task::spawn_blocking(move || execute_in_sandbox(&ws, &pfx, &sn, eto, &evs)).await;
                 if let Ok(Ok((true, fix_stdout, _))) = fix_result {
                     let fix_output = if fix_stdout.trim().is_empty() {
                         "(completed with no output)".to_string()
@@ -331,11 +288,10 @@ async fn run_inner(
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: format!(
-                "Execution failed (iteration {}/{}):\n{}\nFix it.",
-                iteration, max_iterations, last_error
+                "Execution failed (iteration {iteration}/{max_iterations}):\n{last_error}\nFix it."
             ),
         });
     }
 
-    Err((anyhow::anyhow!("{}", last_error), max_iterations))
+    Err((anyhow::anyhow!("{last_error}"), max_iterations))
 }

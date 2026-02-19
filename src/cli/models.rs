@@ -63,8 +63,8 @@ fn cmd_models_list() -> Result<()> {
     }
 
     println!(
-        "\n{:<18} {:<30} {:<12} {}",
-        "KEY", "MODEL_ID", "PROVIDER", "AGENTS"
+        "\n{:<18} {:<30} {:<12} AGENTS",
+        "KEY", "MODEL_ID", "PROVIDER"
     );
     println!("{}", "-".repeat(78));
 
@@ -127,7 +127,7 @@ async fn cmd_models_add() -> Result<()> {
 
     // 3. Choose key
     let default_key = sanitize_model_key(&model_id);
-    let key_input = ask(&format!("Model key [{}]: ", default_key))?;
+    let key_input = ask(&format!("Model key [{default_key}]: "))?;
     let model_key = if key_input.is_empty() {
         default_key
     } else {
@@ -135,7 +135,7 @@ async fn cmd_models_add() -> Result<()> {
     };
 
     if config.models.contains_key(&model_key) {
-        println!("A model with key '{}' already exists.", model_key);
+        println!("A model with key '{model_key}' already exists.");
         return Ok(());
     }
 
@@ -179,14 +179,14 @@ fn cmd_models_remove(key: &str) -> Result<()> {
     if config.active_model.as_deref() == Some(key) {
         config.active_model = config.models.keys().next().cloned();
         if let Some(ref new_active) = config.active_model {
-            println!("Active model changed to '{}'", new_active);
+            println!("Active model changed to '{new_active}'");
         } else {
             println!("No models remaining.");
         }
     }
 
     save_config(&config)?;
-    println!("Removed model '{}'", key);
+    println!("Removed model '{key}'");
 
     Ok(())
 }
@@ -208,6 +208,10 @@ fn cmd_models_set_active(key: &str) -> Result<()> {
 }
 
 fn cmd_models_edit(key: &str) -> Result<()> {
+    fn show<T: std::fmt::Display>(label: &str, val: Option<T>) {
+        println!("  {:<18} {}", label, val.map_or_else(|| "(default)".to_string(), |v| v.to_string()));
+    }
+
     let mut config = load_config()?;
 
     if !require_model(&config, key) {
@@ -215,10 +219,7 @@ fn cmd_models_edit(key: &str) -> Result<()> {
     }
     let model = config.models.get_mut(key).unwrap();
 
-    println!("\n=== Edit Model '{}' ===\n", key);
-    fn show<T: std::fmt::Display>(label: &str, val: Option<T>) {
-        println!("  {:<18} {}", label, val.map_or("(default)".to_string(), |v| v.to_string()));
-    }
+    println!("\n=== Edit Model '{key}' ===\n");
     println!("Current settings:");
     println!("  {:<18} {}", "model_id:", model.model_id);
     println!("  {:<18} {}", "provider:", model.provider);
@@ -229,30 +230,32 @@ fn cmd_models_edit(key: &str) -> Result<()> {
     show("presence_penalty:", model.presence_penalty);
     show("context_tokens:", model.context_tokens);
     println!("  {:<18} {}", "reasoning_effort:", model.reasoning_effort.as_deref().unwrap_or("(none)"));
-    println!("  {:<18} {}", "thinking:", model.thinking.as_ref().map_or("(disabled)".to_string(), |t| {
-        format!("enabled={}, budget={}", t.enabled, t.budget_tokens.map_or("default".to_string(), |v| v.to_string()))
-    }));
+    println!("  {:<18} {}", "thinking:", model.thinking.as_ref().map_or_else(
+        || "(disabled)".to_string(),
+        |t| format!("enabled={}, budget={}", t.enabled,
+            t.budget_tokens.map_or_else(|| "default".to_string(), |v| v.to_string()))
+    ));
     println!("\nEnter new values (empty to keep current, 'none' to clear):\n");
 
-    if let Some(v) = prompt_edit("temperature", model.temperature)? {
+    if let Some(v) = prompt_edit("temperature", model.temperature.as_ref())? {
         model.temperature = v;
     }
-    if let Some(v) = prompt_edit("max_tokens", model.max_tokens)? {
+    if let Some(v) = prompt_edit("max_tokens", model.max_tokens.as_ref())? {
         model.max_tokens = v;
     }
-    if let Some(v) = prompt_edit("top_p", model.top_p)? {
+    if let Some(v) = prompt_edit("top_p", model.top_p.as_ref())? {
         model.top_p = v;
     }
-    if let Some(v) = prompt_edit("frequency_penalty", model.frequency_penalty)? {
+    if let Some(v) = prompt_edit("frequency_penalty", model.frequency_penalty.as_ref())? {
         model.frequency_penalty = v;
     }
-    if let Some(v) = prompt_edit("presence_penalty", model.presence_penalty)? {
+    if let Some(v) = prompt_edit("presence_penalty", model.presence_penalty.as_ref())? {
         model.presence_penalty = v;
     }
-    if let Some(v) = prompt_edit("context_tokens", model.context_tokens)? {
+    if let Some(v) = prompt_edit("context_tokens", model.context_tokens.as_ref())? {
         model.context_tokens = v;
     }
-    if let Some(v) = prompt_edit("reasoning_effort", model.reasoning_effort.clone())? {
+    if let Some(v) = prompt_edit("reasoning_effort", model.reasoning_effort.as_ref())? {
         model.reasoning_effort = v;
     }
 
@@ -273,7 +276,7 @@ fn cmd_models_edit(key: &str) -> Result<()> {
     }
 
     save_config(&config)?;
-    println!("\nModel '{}' updated.", key);
+    println!("\nModel '{key}' updated.");
 
     Ok(())
 }
@@ -287,11 +290,11 @@ fn require_model(config: &crate::config::GatewayConfig, key: &str) -> bool {
     if config.models.contains_key(key) {
         return true;
     }
-    println!("Model '{}' not found.", key);
+    println!("Model '{key}' not found.");
     if !config.models.is_empty() {
         println!("Available models:");
         for k in config.models.keys() {
-            println!("  {}", k);
+            println!("  {k}");
         }
     }
     false
@@ -299,7 +302,7 @@ fn require_model(config: &crate::config::GatewayConfig, key: &str) -> bool {
 
 /// Prompt for an optional value. Returns None if empty, or parses the input.
 fn prompt_optional<T: std::str::FromStr>(label: &str) -> Result<Option<T>> {
-    let input = ask(&format!("{}: ", label))?;
+    let input = ask(&format!("{label}: "))?;
     if input.is_empty() {
         Ok(None)
     } else {
@@ -307,14 +310,15 @@ fn prompt_optional<T: std::str::FromStr>(label: &str) -> Result<Option<T>> {
     }
 }
 
-/// Prompt for editing a value. Returns Some(new_value) if changed, None if kept.
+/// Prompt for editing a value. Returns `Some(new_value)` if changed, None if kept.
 /// "none" clears the value, empty keeps current.
+#[allow(clippy::option_option)]
 fn prompt_edit<T: std::str::FromStr + std::fmt::Display>(
     name: &str,
-    current: Option<T>,
+    current: Option<&T>,
 ) -> Result<Option<Option<T>>> {
-    let cur = current.as_ref().map_or("(default)".to_string(), |v| v.to_string());
-    let input = ask(&format!("{} [{}]: ", name, cur))?;
+    let cur = current.map_or_else(|| "(default)".to_string(), ToString::to_string);
+    let input = ask(&format!("{name} [{cur}]: "))?;
     if input.is_empty() {
         Ok(None) // keep current
     } else if input == "none" {

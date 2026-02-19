@@ -15,9 +15,9 @@ fn write_pid_file() -> Result<()> {
     let path = pid_path();
     let dir = config_dir();
     fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create config dir {:?}", dir))?;
+        .with_context(|| format!("Failed to create config dir {}", dir.display()))?;
     fs::write(&path, std::process::id().to_string())
-        .with_context(|| format!("Failed to write PID file {:?}", path))?;
+        .with_context(|| format!("Failed to write PID file {}", path.display()))?;
     Ok(())
 }
 

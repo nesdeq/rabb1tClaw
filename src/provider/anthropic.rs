@@ -5,7 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::debug;
 
 pub struct AnthropicProvider {
     base_url: String,
@@ -122,7 +122,7 @@ impl LlmProvider for AnthropicProvider {
         }
 
         let url = format!("{}/messages", self.base_url);
-        info!("[Anthropic] stream model={}", request.model);
+        debug!("[Anthropic] stream model={}", request.model);
         if let Some(sys) = &system {
             debug!("[Anthropic] system: {}",
                 sys.chars().take(60).collect::<String>());

@@ -107,8 +107,8 @@ fn build_container(workspace: &Path, python_prefix: &Path, network: bool) -> hak
 #[test]
 fn test_find_python() {
     let (executable, prefix) = find_python();
-    println!("executable: {}", executable);
-    println!("prefix: {}", prefix);
+    println!("executable: {executable}");
+    println!("prefix: {prefix}");
     assert!(Path::new(&executable).exists(), "binary must exist");
     assert!(Path::new(&prefix).is_dir(), "prefix must be a directory");
 }
@@ -258,11 +258,11 @@ fn test_file_creation_in_sandbox() {
     // Script that creates a file
     std::fs::write(
         tmp.path().join("write_test.py"),
-        r#"
+        r"
 with open('/workspace/output.md', 'w') as f:
     f.write('# Hello\n\nThis is a test.\n')
 print('file written')
-"#,
+",
     ).unwrap();
 
     let container = build_container(tmp.path(), Path::new(&prefix), false);
@@ -283,7 +283,7 @@ print('file written')
     assert!(output.status.success(), "script failed: {}", output.status.reason);
 
     let content = std::fs::read_to_string(tmp.path().join("output.md")).expect("output.md must exist");
-    assert!(content.contains("Hello"), "file content: {}", content);
+    assert!(content.contains("Hello"), "file content: {content}");
 }
 
 // ============================================================================
@@ -387,11 +387,11 @@ fn test_http_request_from_sandbox() {
     // Script that makes an HTTP request
     std::fs::write(
         tmp.path().join("http_test.py"),
-        r#"
+        r"
 import urllib.request
 resp = urllib.request.urlopen('https://httpbin.org/get', timeout=10)
 print(f'status: {resp.status}')
-"#,
+",
     ).unwrap();
 
     let container = build_container(tmp.path(), Path::new(&prefix), true);
@@ -412,5 +412,5 @@ print(f'status: {resp.status}')
 
     assert!(output.status.success(), "http request failed: {}", output.status.reason);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("status: 200"), "expected 200, got: {}", stdout);
+    assert!(stdout.contains("status: 200"), "expected 200, got: {stdout}");
 }
