@@ -132,6 +132,7 @@ pub(crate) fn ensure_venv(workspace: &Path, exec_timeout_secs: u64) -> anyhow::R
         .command(&python)
         .args(["-m", "venv", "/workspace/.venv"])
         .current_dir("/workspace")
+        .env("HOME", "/workspace")
         .stdout(hakoniwa::Stdio::piped())
         .stderr(hakoniwa::Stdio::piped())
         .wait_timeout(exec_timeout_secs)
@@ -171,6 +172,7 @@ pub(crate) fn pip_install(
     let mut cmd = container.command("/workspace/.venv/bin/pip");
     cmd.args(&args)
         .current_dir("/workspace")
+        .env("HOME", "/workspace")
         .stdout(hakoniwa::Stdio::piped())
         .stderr(hakoniwa::Stdio::piped())
         .wait_timeout(exec_timeout_secs);
@@ -207,6 +209,7 @@ pub(crate) fn execute_in_sandbox(
     let mut cmd = container.command("/workspace/.venv/bin/python");
     cmd.arg(&script_path)
         .current_dir("/workspace")
+        .env("HOME", "/workspace")
         .stdout(hakoniwa::Stdio::piped())
         .stderr(hakoniwa::Stdio::piped())
         .wait_timeout(exec_timeout_secs);
