@@ -78,8 +78,8 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
         }
     };
 
-    let run_id = params.idempotency_key.clone();
-    let message = params.message.trim().to_string();
+    let AgentParams { message, idempotency_key: run_id } = params;
+    let message = message.trim().to_string();
 
     if message.is_empty() {
         return ctx
@@ -125,7 +125,7 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
     };
 
     // System prompt is compiled-in and not user-overridable
-    let (code_max, search_max, advanced_max) = {
+    let (code_max, search_max, advanced_max, task_log_max) = {
         let cfg = ctx.state.gateway_config.read().await;
         (
             cfg.agent_config(AgentKind::Code)
@@ -134,9 +134,11 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
                 .and_then(|a| a.max_concurrent).unwrap_or(crate::cli::defaults::DEFAULT_SEARCH_MAX_CONCURRENT),
             cfg.agent_config(AgentKind::Advanced)
                 .and_then(|a| a.max_concurrent).unwrap_or(crate::cli::defaults::DEFAULT_ADVANCED_MAX_CONCURRENT),
+            cfg.agent_config(AgentKind::Main)
+                .and_then(|a| a.task_log_max_entries)
+                .unwrap_or(crate::cli::defaults::DEFAULT_TASK_LOG_MAX_ENTRIES),
         )
     };
-    let task_log_max = crate::agent::tasklog::max_entries(&ctx.state).await;
     let mut system_prompt = DEFAULT_SYSTEM_PROMPT
         .replace("{code_max_concurrent}", &code_max.to_string())
         .replace("{search_max_concurrent}", &search_max.to_string())
@@ -175,22 +177,28 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
     };
 
     // Build messages from session history + new user message (single read lock)
+    // Timestamps are injected on-the-fly (NOT persisted) so the LLM can reason
+    // about temporal gaps across multi-day/multi-week conversations.
     let mut messages: Vec<ChatMessage> = if let Some(ref token) = device_token {
         state.session_manager.get_history(token).await
             .into_iter()
-            .map(|t| ChatMessage { role: t.role, content: t.content })
+            .map(|t| {
+                let content = stamp_message(t.timestamp_ms, &t.content);
+                ChatMessage { role: t.role, content }
+            })
             .collect()
     } else {
         Vec::new()
     };
     // Prepend @@task block to user message for LLM (NOT persisted in session)
-    let llm_message = task_context.as_ref().map_or_else(
-        || message.clone(),
-        |ctx| {
+    let stamped = stamp_message(accepted_at, &message);
+    let llm_message = match task_context.as_ref() {
+        Some(ctx) => {
             tracing::debug!("[MAIN] Injecting task context ({} chars)", ctx.len());
-            format!("@@task\n{ctx}\n@@end\n\n{message}")
-        },
-    );
+            format!("@@task\n{ctx}\n@@end\n\n{stamped}")
+        }
+        None => stamped,
+    };
 
     messages.push(ChatMessage {
         role: "user".to_string(),
@@ -223,6 +231,25 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
 
     tokio::spawn(async move { stream_agent_response(job).await });
     Ok(())
+}
+
+// ============================================================================
+// Message Timestamps
+// ============================================================================
+
+/// Prefix a message with a compact timestamp for LLM temporal awareness.
+/// Format: `[Apr 2, 14:30]` (current year) or `[Apr 2 2025, 14:30]` (past year).
+fn stamp_message(timestamp_ms: u64, content: &str) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    let Some(dt) = Local.timestamp_millis_opt(timestamp_ms as i64).single() else {
+        return content.to_string();
+    };
+    let ts = if dt.year() == Local::now().year() {
+        dt.format("%b %-d, %H:%M").to_string()
+    } else {
+        dt.format("%b %-d %Y, %H:%M").to_string()
+    };
+    format!("[{ts}] {content}")
 }
 
 // ============================================================================
@@ -453,16 +480,18 @@ async fn dispatch_background_agents(
 
     let prefix = crate::agent::session::token_prefix(token);
 
-    let (code_max_conc, search_max_conc, advanced_max_conc, search_limits) = {
+    let (code_max_conc, search_max_conc, advanced_max_conc, search_limits, task_log_max) = {
         let cfg = state.gateway_config.read().await;
         (
             cfg.agent_config(AgentKind::Code).and_then(|a| a.max_concurrent).unwrap_or(crate::cli::defaults::DEFAULT_CODE_MAX_CONCURRENT),
             cfg.agent_config(AgentKind::Search).and_then(|a| a.max_concurrent).unwrap_or(crate::cli::defaults::DEFAULT_SEARCH_MAX_CONCURRENT),
             cfg.agent_config(AgentKind::Advanced).and_then(|a| a.max_concurrent).unwrap_or(crate::cli::defaults::DEFAULT_ADVANCED_MAX_CONCURRENT),
             crate::agent::search::SearchLimits::from_config(&cfg),
+            cfg.agent_config(AgentKind::Main)
+                .and_then(|a| a.task_log_max_entries)
+                .unwrap_or(crate::cli::defaults::DEFAULT_TASK_LOG_MAX_ENTRIES),
         )
     };
-    let task_log_max = crate::agent::tasklog::max_entries(state).await;
 
     let mut seen_dispatches: HashSet<(String, String)> = HashSet::new();
     for marker in parse_task_markers(full_response) {

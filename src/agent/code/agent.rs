@@ -6,6 +6,7 @@ use tracing::{debug, info};
 
 use super::helpers::{extract_packages, extract_python_code, list_workspace};
 use super::sandbox::{ensure_venv, execute_in_sandbox, pip_install, workspace_dir};
+use std::path::Path;
 use super::tracker::{CodeTaskStatus, CodeTaskTracker};
 use crate::agent::tracker::truncate;
 
@@ -64,6 +65,32 @@ pub async fn run_agent(
     };
     tracker.complete(&prefix, task_id, status).await;
     crate::agent::tasklog::append(&prefix, &event, task_log_max);
+}
+
+/// Execute a script in the sandbox via `spawn_blocking`.
+async fn exec_sandbox(
+    workspace: &Path,
+    python_prefix: &Path,
+    script_name: &str,
+    exec_timeout_secs: u64,
+    env_vars: &[(String, String)],
+) -> anyhow::Result<(bool, String, String)> {
+    let ws = workspace.to_path_buf();
+    let pfx = python_prefix.to_path_buf();
+    let sn = script_name.to_string();
+    let evs: Vec<(String, String)> = env_vars.to_vec();
+    tokio::task::spawn_blocking(move || execute_in_sandbox(&ws, &pfx, &sn, exec_timeout_secs, &evs))
+        .await
+        .map_err(|e| anyhow::anyhow!("join error: {e}"))?
+}
+
+/// Format sandbox stdout into a truncated output string.
+fn format_output(stdout: &str, max_output_tokens: usize) -> String {
+    if stdout.trim().is_empty() {
+        "(completed with no output)".to_string()
+    } else {
+        truncate(stdout, max_output_tokens)
+    }
 }
 
 /// Shared code execution loop used by both the standalone code agent and the advanced agent.
@@ -181,25 +208,13 @@ pub(crate) async fn run_code_loop(
         }
 
         // Execute in sandbox
-        let ws = workspace.clone();
-        let pfx = python_prefix.clone();
-        let sn = script_name.clone();
-        let eto = exec_timeout_secs;
-        let evs: Vec<(String, String)> = env_vars.to_vec();
-        let exec_result =
-            tokio::task::spawn_blocking(move || execute_in_sandbox(&ws, &pfx, &sn, eto, &evs)).await;
-        let (ok, stdout, stderr) = match exec_result {
-            Err(e) => fail!(iteration, anyhow::anyhow!("join error: {}", e)),
-            Ok(Err(e)) => fail!(iteration, e),
-            Ok(Ok(v)) => v,
+        let (ok, stdout, stderr) = match exec_sandbox(&workspace, &python_prefix, &script_name, exec_timeout_secs, env_vars).await {
+            Ok(v) => v,
+            Err(e) => fail!(iteration, e),
         };
 
         if ok {
-            let output = if stdout.trim().is_empty() {
-                "(completed with no output)".to_string()
-            } else {
-                truncate(&stdout, max_output_tokens)
-            };
+            let output = format_output(&stdout, max_output_tokens);
 
             if !verify {
                 return Ok((output, iteration));
@@ -252,21 +267,8 @@ pub(crate) async fn run_code_loop(
             // directly instead of burning another LLM call.
             if let Some(fix_code) = extract_python_code(&verdict) {
                 let _ = std::fs::write(workspace.join(&script_name), &fix_code);
-
-                let ws = workspace.clone();
-                let pfx = python_prefix.clone();
-                let sn = script_name.clone();
-                let eto = exec_timeout_secs;
-                let evs: Vec<(String, String)> = env_vars.to_vec();
-                let fix_result =
-                    tokio::task::spawn_blocking(move || execute_in_sandbox(&ws, &pfx, &sn, eto, &evs)).await;
-                if let Ok(Ok((true, fix_stdout, _))) = fix_result {
-                    let fix_output = if fix_stdout.trim().is_empty() {
-                        "(completed with no output)".to_string()
-                    } else {
-                        truncate(&fix_stdout, max_output_tokens)
-                    };
-                    return Ok((fix_output, iteration));
+                if let Ok((true, fix_stdout, _)) = exec_sandbox(&workspace, &python_prefix, &script_name, exec_timeout_secs, env_vars).await {
+                    return Ok((format_output(&fix_stdout, max_output_tokens), iteration));
                 }
             }
 

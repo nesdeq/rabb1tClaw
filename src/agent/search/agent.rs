@@ -346,21 +346,8 @@ fn collect_and_dedup(
             }
         }
 
-        // Organic results (deduplicated by URL)
-        for r in &resp.organic {
-            let url = r.link.as_deref().unwrap_or("");
-            if !url.is_empty() && seen_urls.insert(url.to_string()) {
-                results.push(SearchResult {
-                    title: r.title.as_deref().unwrap_or("").to_string(),
-                    url: url.to_string(),
-                    snippet: r.snippet.as_deref().unwrap_or("").to_string(),
-                    date: r.date.as_deref().unwrap_or("").to_string(),
-                });
-            }
-        }
-
-        // News results (deduplicated by URL)
-        for r in &resp.news {
+        // Organic + news results (deduplicated by URL)
+        for r in resp.organic.iter().chain(resp.news.iter()) {
             let url = r.link.as_deref().unwrap_or("");
             if !url.is_empty() && seen_urls.insert(url.to_string()) {
                 results.push(SearchResult {

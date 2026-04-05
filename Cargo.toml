@@ -1,6 +1,6 @@
 [package]
 name = "rabb1tclaw"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Minimal Rust LLM gateway for Rabbit R1 and other devices"
 license = "MIT"
@@ -30,7 +30,7 @@ sha2 = "0.10"
 
 # Utils
 uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

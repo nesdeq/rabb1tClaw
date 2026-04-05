@@ -11,7 +11,7 @@
 
 rabb1tClaw implements the [OpenClaw](https://github.com/openclaw/openclaw) WebSocket protocol v3, giving your R1 a direct line to OpenAI, Anthropic, DeepInfra, or any OpenAI-compatible endpoint. Built on async Rust (Tokio + Axum), it handles hundreds of concurrent device connections with streaming responses that start arriving on the first token. Runs comfortably on a Raspberry Pi.
 
-43 Rust source files. 7,536 lines. That's the whole thing.
+43 Rust source files. 7,463 lines. That's the whole thing.
 
 <br clear="both">
 
@@ -162,6 +162,20 @@ The server watches config files every 2 seconds. Edit them and changes apply liv
 ---
 
 ## Changelog
+
+### v0.3.2
+
+**Prompt compression, code agent cleanup, and timestamp injection.**
+
+- **System prompt overhaul** -- all 6 prompt files (main, code, advanced, memory, search analyze, search synthesize) condensed: removed verbose examples and redundant instructions while preserving all behavioral rules. Shorter prompts = more context budget for conversation.
+- **Message timestamps** -- conversation history messages are now prefixed with compact timestamps (`[Apr 2, 14:30]`) injected on-the-fly (not persisted), giving the LLM temporal awareness across multi-day conversations.
+- **Code agent refactor** -- extracted `exec_sandbox()` and `format_output()` helpers, eliminating duplicated `spawn_blocking` + truncation logic in the execution and verification paths.
+- **Search result dedup** -- merged separate organic and news result loops into a single `.chain()` iterator with shared deduplication.
+- **Stream filter simplification** -- `flush()` method reduced from nested conditionals to a flat early-return.
+- **Config reference externalized** -- moved the inline 96-line `CONFIG_REFERENCE` constant to `src/config/config_reference.txt` (loaded via `include_str!`).
+- **Task log config** -- `task_log_max_entries` now read inline from gateway config alongside other agent limits, removing a separate async helper call.
+- **Deploy script** -- removed build and auto-start steps from `deploy-local.sh` (copy-only).
+- **Dependency cleanup** -- dropped unused `serde` feature from `chrono`.
 
 ### v0.3.1
 

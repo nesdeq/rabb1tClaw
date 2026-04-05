@@ -116,18 +116,12 @@ impl MarkerFilter {
 
     /// Flush any remaining buffered text (called on stream end).
     pub fn flush<'a>(&mut self, full_response: &'a str) -> Option<&'a str> {
-        if self.eating {
-            // Suppress incomplete block
+        if self.eating || self.committed >= full_response.len() {
             return None;
         }
-        if self.committed < full_response.len() {
-            let remaining = &full_response[self.committed..];
-            if !remaining.is_empty() {
-                self.committed = full_response.len();
-                return Some(remaining);
-            }
-        }
-        None
+        let remaining = &full_response[self.committed..];
+        self.committed = full_response.len();
+        Some(remaining)
     }
 }
 

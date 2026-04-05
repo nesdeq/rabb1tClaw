@@ -1,0 +1,96 @@
+
+# ─── Parameter Reference ─────────────────────────────────────────────
+#
+# providers:
+#   my-provider:
+#     api: openai              # "openai" or "anthropic"
+#     base_url: https://api.openai.com/v1
+#     api_key: sk-...
+#     name: My Provider        # optional display name
+#
+# models:
+#   my-model:
+#     provider: my-provider    # must match a key in providers
+#     model_id: gpt-4o         # model ID sent to the API
+#     max_tokens: 4096         # max output tokens (optional)
+#     temperature: 0.7         # 0.0–2.0 (optional)
+#     top_p: 1.0               # nucleus sampling (optional)
+#     frequency_penalty: 0.0   # -2.0–2.0 (optional, OpenAI only)
+#     presence_penalty: 0.0    # -2.0–2.0 (optional, OpenAI only)
+#     reasoning_effort: medium # low/medium/high (OpenAI o-series & gpt-5.x only)
+#     context_tokens: 200000   # conversation history FIFO in tokens (default: 200000)
+#     thinking:                # thinking / chain-of-thought control
+#       enabled: true
+#       budget_tokens: 10000   # Anthropic only — max thinking tokens
+#
+# active_model: my-model       # which model to use by default
+#
+# agents:                          # per-agent model overrides + operational limits
+#   main:
+#     model: my-model              # falls back to active_model if omitted
+#     temperature: 0.9             # override model config params
+#     reasoning_effort: medium     # baseline for reasoning models
+#     context_tokens: 200000       # conversation history FIFO (tokens, tiktoken)
+#     task_log_max_entries: 50     # max entries in persistent task log file
+#   code:
+#     model: cheap-model           # use a different model for code execution
+#     temperature: 0.0
+#     max_tokens: 16384
+#     reasoning_effort: medium
+#     max_concurrent: 2            # max parallel code tasks per device
+#     max_iterations: 5            # self-healing retry limit
+#     max_output_tokens: 500       # stdout/stderr truncation per execution (tokens, tiktoken)
+#     exec_timeout_secs: 120       # sandbox timeout
+#   memory:
+#     model: cheap-model           # use a different model for memory extraction
+#     temperature: 0.0
+#     max_tokens: 1024
+#     reasoning_effort: medium
+#     turn_interval: 5             # extract memory every N user turns
+#     max_words: 500               # word limit for persisted memory
+#   search:
+#     model: cheap-model           # model for query analysis / evaluation / synthesis
+#     reasoning_effort: medium
+#     max_concurrent: 3            # max parallel searches per device
+#     max_results: 10              # Serper organic results to fetch
+#     max_news: 5                  # Serper news results to fetch
+#     max_people_also_ask: 5       # "People Also Ask" entries to include
+#     max_total_tokens: 16000      # quick search context budget (tokens, tiktoken)
+#     max_total_tokens_thorough: 32000  # thorough search context budget
+#     max_page_tokens: 4000        # per-page budget for deep reads (tokens, tiktoken)
+#     fetch_timeout_secs: 15       # HTTP timeout for fetching deep-read pages
+#   advanced:
+#     model: smart-model            # model for orchestration planning
+#     reasoning_effort: medium
+#     max_concurrent: 1             # max parallel advanced tasks per device
+#     max_iterations: 20            # max orchestration loop steps
+#     exec_timeout_secs: 600        # total wall-clock timeout for entire task
+#     max_output_tokens: 500        # stdout/stderr truncation for code subtasks
+#
+# ─── How parameters behave per provider ──────────────────────────────
+#
+# OpenAI (gpt-4o, etc.):
+#   All params sent as-is. frequency_penalty & presence_penalty supported.
+#
+# OpenAI reasoning (o1, o3, o4-mini, gpt-5, gpt-5.2, ...):
+#   max_tokens      → sent as max_completion_tokens (automatic)
+#   temperature     → omitted (server decides)
+#   reasoning_effort→ sent as-is (low/medium/high)
+#   thinking        → ignored (reasoning is always on for these models)
+#
+# Anthropic (claude-sonnet-4-5, claude-opus-4, ...):
+#   thinking.enabled      → enables extended thinking
+#   thinking.budget_tokens→ max tokens the model can use for thinking
+#   temperature           → omitted when thinking is enabled (API requirement)
+#   frequency/presence_penalty → not supported, ignored
+#   reasoning_effort      → not supported, ignored
+#
+# DeepInfra / vLLM (Kimi-K2.5, DeepSeek R1, Qwen QwQ, ...):
+#   thinking.enabled → on/off toggle (sent as chat_template_kwargs)
+#   thinking.budget_tokens → ignored (no budget control on DeepInfra)
+#   reasoning_effort → ignored (DeepInfra silently drops it)
+#   When thinking is on, reasoning output appears in a separate field
+#     and is automatically discarded — only the final answer is returned.
+#   When thinking is off, the model skips chain-of-thought (faster).
+#   frequency_penalty & presence_penalty are supported.
+# ──────────────────────────────────────────────────────────────────────
