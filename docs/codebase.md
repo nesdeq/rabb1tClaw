@@ -1,6 +1,6 @@
 # Codebase Summary — rabb1tClaw
 
-**7,543 lines of Rust** across 43 `.rs` files + **598 lines of system prompts** across 6 `.md` files in src/prompts/.
+**7,463 lines of Rust** across 43 `.rs` files + **302 lines of system prompts** across 6 `.md` files in src/prompts/.
 
 ## What It Is
 A minimal Rust LLM gateway for the Rabbit R1 and other devices. WebSocket server (protocol v3) that sits between devices and LLM APIs (OpenAI, Anthropic, DeepInfra/vLLM). It runs a main conversational agent plus four background agents: code execution, memory extraction, web search, and advanced orchestration.
