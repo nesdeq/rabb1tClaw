@@ -39,13 +39,14 @@ impl<S: TaskStatus> BackgroundTracker<S> {
     }
 
     /// Register a new item. Returns `Some(())` on success, `None` if at
-    /// capacity.
+    /// capacity. Retains at most `max_retained` finished items per device.
     pub async fn register(
         &self,
         prefix: &str,
         id: u32,
         description: String,
         max_concurrent: usize,
+        max_retained: usize,
     ) -> Option<()> {
         let item = TrackedItem {
             id,
@@ -61,6 +62,20 @@ impl<S: TaskStatus> BackgroundTracker<S> {
         if running >= max_concurrent {
             return None;
         }
+
+        // Drop the oldest finished items so history cannot grow without bound
+        let mut excess = (entry.len() - running).saturating_sub(max_retained);
+        if excess > 0 {
+            entry.retain(|t| {
+                if excess > 0 && !t.status.is_running() {
+                    excess -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
         entry.push(item);
         drop(items);
         Some(())
@@ -85,6 +100,12 @@ impl<S: TaskStatus> BackgroundTracker<S> {
                 item.status = status;
             }
         }
+    }
+
+    /// Total tracked items for a device, running or finished.
+    #[cfg(test)]
+    pub async fn tracked_len(&self, prefix: &str) -> usize {
+        self.items.read().await.get(prefix).map_or(0, Vec::len)
     }
 
     /// Get currently running items for a device (read-only, no side effects).
@@ -115,6 +136,16 @@ pub fn truncate(s: &str, max_tokens: usize) -> String {
     if tokens.len() <= max_tokens {
         return s.to_string();
     }
-    let text = bpe().decode(tokens[..max_tokens].to_vec()).unwrap_or_default();
-    format!("{text}...")
+    // A token boundary can fall inside a multi-byte character, which makes the
+    // prefix invalid UTF-8; step back until it decodes rather than lose it all.
+    let mut take = max_tokens;
+    loop {
+        if take == 0 {
+            return "...".to_string();
+        }
+        if let Ok(text) = bpe().decode(tokens[..take].to_vec()) {
+            return format!("{text}...");
+        }
+        take -= 1;
+    }
 }

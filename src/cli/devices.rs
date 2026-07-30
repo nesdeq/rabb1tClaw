@@ -127,7 +127,7 @@ pub(super) fn cmd_onboard(config: &GatewayConfig, store: &mut DeviceStore) -> Re
         name.to_string()
     };
 
-    let device = create_device(&name);
+    let device = create_device(store, &name);
     add_device(store, device.clone());
     save_devices(store)?;
 

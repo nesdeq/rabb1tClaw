@@ -34,3 +34,6 @@ deploy.*
 perf.data
 perf.data.old
 flamegraph.svg
+
+# Audit handoff notes (local only)
+/continue.md

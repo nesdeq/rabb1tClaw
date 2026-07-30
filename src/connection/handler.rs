@@ -1,6 +1,6 @@
 //! WebSocket connection lifecycle: handshake, auth, frame routing, tick, cleanup.
 
-use super::auth::{authorize_connect, is_loopback, AuthFailure, AuthResult};
+use super::auth::{authorize_connect, is_loopback, AuthFailure, AuthMethod, AuthResult};
 use super::server::ServerState;
 use crate::agent::dispatch_method;
 use crate::config::{config_dir, config_path};
@@ -198,7 +198,11 @@ async fn handle_connect(
 
     match auth_result {
         AuthResult::Ok(method) => {
-            let device_token = connect_auth.and_then(|a| a.token.clone());
+            // Session identity comes from a validated device, never from raw client input
+            let device_token = match method {
+                AuthMethod::DeviceToken => connect_auth.and_then(|a| a.token.clone()),
+                AuthMethod::Local => None,
+            };
             let prefix = device_token.as_ref()
                 .map_or_else(|| conn_id.to_string(), |t| crate::agent::session::token_prefix(t));
             info!("[{}] connected method={:?}", prefix, method);

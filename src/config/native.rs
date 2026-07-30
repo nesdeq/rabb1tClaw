@@ -298,19 +298,39 @@ pub fn load_config() -> Result<GatewayConfig> {
 }
 
 /// Write data to a file with 0o600 permissions, creating parent dirs as needed.
+/// Staged through a sibling temp file and renamed, so an interrupted write can
+/// never leave a torn file in place of the previous contents.
 pub fn write_secure(path: &std::path::Path, content: impl AsRef<[u8]>) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("Failed to create dir {}", dir.display()))?;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create dir {}", dir.display()))?;
+
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    if let Err(e) = stage(&tmp, content.as_ref()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::write(path, content)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("Failed to replace {}", path.display()))
+}
+
+/// Write and flush the staging file with restrictive permissions.
+fn stage(tmp: &std::path::Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut f = fs::File::create(tmp)
+        .with_context(|| format!("Failed to create {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        f.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to secure {}", tmp.display()))?;
     }
-    Ok(())
+    f.write_all(content)
+        .with_context(|| format!("Failed to write {}", tmp.display()))?;
+    f.sync_all()
+        .with_context(|| format!("Failed to flush {}", tmp.display()))
 }
 
 /// Save config with commented parameter reference appended

@@ -71,7 +71,7 @@ pub fn authorize_connect(
     connect_auth: Option<&ConnectAuth>,
     is_local: bool,
 ) -> AuthResult {
-    // Local connections can bypass auth if no devices configured
+    // Loopback may bypass auth only while no device has been paired yet
     if is_local && device_store.devices.is_empty() {
         return AuthResult::Ok(AuthMethod::Local);
     }
@@ -83,12 +83,7 @@ pub fn authorize_connect(
         }
     }
 
-    // No devices configured, allow connection
-    if device_store.devices.is_empty() {
-        return AuthResult::Ok(AuthMethod::Local);
-    }
-
-    // No token provided but devices exist - require pairing
+    // Deny by default: a non-loopback client must present a valid device token
     tracing::info!("Auth: needs pairing (no token provided)");
     AuthResult::Failed(AuthFailure::NeedsPairing)
 }

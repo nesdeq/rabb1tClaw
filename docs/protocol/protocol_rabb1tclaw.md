@@ -325,7 +325,7 @@ Primary LLM invocation with streaming response.
 }
 ```
 
-**Idempotency:** Duplicate `idempotencyKey` while a request is in-flight blocks until the first request completes.
+**Idempotency:** Keys are scoped per device. A duplicate `idempotencyKey` while a run is in-flight is acknowledged immediately with the same `runId` and does not start a second run; the in-flight run's `agent` and `chat` events carry that `runId` and serve both requests. Every request id still receives its own `res`.
 
 ### 6.4 `chat.history`
 

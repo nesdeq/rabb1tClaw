@@ -260,7 +260,7 @@ All agents run concurrently in the background. Results are delivered on the user
 │  ┌───────────────────────────────────────────────────────────────┐      │
 │  │  ORCHESTRATION LOOP (step 1..=max_steps)                      │      │
 │  │                                                               │      │
-│  │  Check total timeout (pauses during question wait)            │      │
+│  │  Check total timeout (also bounds any wait for an answer)     │      │
 │  │  Update tracker → Running { step, detail }                    │      │
 │  │                                                               │      │
 │  │  ┌──────────────────────────────────────────────────────┐     │      │
@@ -309,8 +309,8 @@ All agents run concurrently in the background. Results are delivered on the user
 │  │     Create oneshot channel                                    │      │
 │  │     Store PendingQuestion { prefix, task_id, answer_tx }      │      │
 │  │       in state.advanced_questions                             │      │
-│  │     AWAIT answer_rx (blocks indefinitely)                     │      │
-│  │     → timeout clock pauses during wait                        │      │
+│  │     AWAIT answer_rx (bounded, see below)                      │      │
+│  │     → wait bounded by remaining total timeout                 │      │
 │  │     Push user answer as message                               │      │
 │  │                                                               │      │
 │  │  ┌──────────────────────────────────────────────────────┐     │      │

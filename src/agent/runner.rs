@@ -63,6 +63,7 @@ struct StreamJob {
     prefix: String,
     provider_name: String,
     model_id: String,
+    dedup_key: (Option<String>, String),
 }
 
 #[allow(clippy::too_many_lines)]
@@ -87,28 +88,9 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
             .await;
     }
 
-    // Idempotency check: if this request is already in progress, wait for it
-    let new_notify = Arc::new(tokio::sync::Notify::new());
-    #[allow(clippy::option_if_let_else)] // borrow checker prevents map_or_else here
-    let (notify, is_duplicate) = {
-        let mut requests = ctx.state.active_requests.write().await;
-        if let Some(existing_notify) = requests.get(&run_id) {
-            (existing_notify.clone(), true)
-        } else {
-            requests.insert(run_id.clone(), new_notify.clone());
-            drop(requests);
-            (new_notify, false)
-        }
-    };
-
-    // If this is a duplicate request, wait for the original to complete
-    if is_duplicate {
-        tracing::debug!("[MAIN] Waiting for in-progress request: {}", run_id);
-        notify.notified().await;
-        // The first request will have already sent the response
-        return Ok(());
-    }
-
+    // Every request gets its own `res`; the shared runId ties a retry to the
+    // in-flight run, whose stream events already carry that runId.
+    // Acknowledged before claiming the key so a send failure cannot leak one.
     let accepted_at = now_ms();
     ctx.respond(json!({
         "runId": run_id,
@@ -117,8 +99,18 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
     }))
     .await?;
 
+    // Idempotency, scoped per device so two devices cannot collide on a key
+    let dedup_key = (ctx.device_token.clone(), run_id.clone());
+    let is_duplicate = !ctx.state.active_requests.write().await.insert(dedup_key.clone());
+
+    if is_duplicate {
+        tracing::debug!("[MAIN] Deduplicated in-flight request: {}", run_id);
+        return Ok(());
+    }
+
     // Resolve agent model + provider
     let Some(resolved) = resolve_agent_model(ctx.state, AgentKind::Main).await else {
+        ctx.state.active_requests.write().await.remove(&dedup_key);
         emit_run_error(&ctx.tx, &run_id, &ctx.request_id, 0,
             "no LLM model configured").await;
         return Ok(());
@@ -208,7 +200,8 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
     // Token-based FIFO: trim oldest user+assistant pairs to fit context budget
     trim_pairs_to_budget(&mut messages, resolved.context_tokens);
 
-    // NOTE: user message is persisted inside the spawned task (off the hot path)
+    // NOTE: both turns are persisted together once the stream completes, so a
+    // failed run cannot leave an unpaired user turn in history
 
     tracing::debug!("[MAIN] System prompt ({} chars):\n{}", system_prompt.len(), system_prompt);
 
@@ -227,6 +220,7 @@ pub async fn handle_agent(ctx: &HandlerContext<'_>, params: Option<serde_json::V
         prefix,
         provider_name: resolved.provider_name,
         model_id: resolved.model_id,
+        dedup_key,
     };
 
     tokio::spawn(async move { stream_agent_response(job).await });
@@ -263,7 +257,7 @@ fn msg_tokens(m: &ChatMessage) -> u32 {
 
 /// Trim oldest user+assistant pairs from the front until within `budget` tokens.
 /// The final element (current user message) is always preserved.
-fn trim_pairs_to_budget(messages: &mut Vec<ChatMessage>, budget: u32) {
+pub(crate) fn trim_pairs_to_budget(messages: &mut Vec<ChatMessage>, budget: u32) {
     // Pre-compute token counts once to avoid re-tokenizing during the trim loop
     let counts: Vec<u32> = messages.iter().map(msg_tokens).collect();
     let total: u32 = counts.iter().sum();
@@ -354,7 +348,7 @@ async fn stream_agent_response(job: StreamJob) {
     let StreamJob {
         tx, state, provider, request, run_id, request_id,
         session_key, device_token, user_message,
-        prefix, provider_name, model_id,
+        prefix, provider_name, model_id, dedup_key,
     } = job;
 
     let started_at = now_ms();
@@ -369,13 +363,6 @@ async fn stream_agent_response(job: StreamJob) {
 
     // Start LLM call (spawns HTTP request internally, returns immediately)
     let stream_result = provider.chat_stream(request).await;
-
-    // Record user message concurrently with in-flight HTTP request
-    if let Some(ref token) = device_token {
-        state.session_manager.record_message(
-            token, "user", &user_message, Some(&run_id),
-        ).await;
-    }
 
     match stream_result {
         Ok(mut rx) => {
@@ -431,7 +418,10 @@ async fn stream_agent_response(job: StreamJob) {
                         let clean_response = crate::agent::markers::strip_task_markers(&full_response);
 
                         if let Some(ref token) = device_token {
-                            // Record assistant message (single lock + persist)
+                            // Record the exchange as a pair so history stays alternating
+                            state.session_manager.record_message(
+                                token, "user", &user_message, Some(&run_id),
+                            ).await;
                             state.session_manager.record_message(
                                 token, "assistant", &clean_response, Some(&run_id),
                             ).await;
@@ -458,11 +448,8 @@ async fn stream_agent_response(job: StreamJob) {
         }
     }
 
-    // Cleanup: remove from active_requests and notify any waiting duplicates
-    let notify = state.active_requests.write().await.remove(&run_id);
-    if let Some(notify) = notify {
-        notify.notify_waiters();
-    }
+    // Cleanup: the run is no longer in flight, so its key is free to reuse
+    state.active_requests.write().await.remove(&dedup_key);
 }
 
 // ============================================================================
@@ -506,7 +493,7 @@ async fn dispatch_background_agents(
                 "code" => {
                     let task_id = state.next_id();
                     let tracker = state.code_task_tracker.clone();
-                    if tracker.register(&prefix, task_id, desc.clone(), code_max_conc).await.is_some() {
+                    if tracker.register(&prefix, task_id, desc.clone(), code_max_conc, task_log_max).await.is_some() {
                         tracing::info!("[{}] [MAIN] code [{}] dispatched", prefix, task_id);
                         tracing::debug!("[MAIN] code [{}] desc: {}", task_id, desc);
                         crate::agent::tasklog::append(&prefix, &format!("dispatched #{task_id} code — {desc}"), task_log_max);
@@ -522,7 +509,7 @@ async fn dispatch_background_agents(
                 "search" => {
                     let task_id = state.next_id();
                     let tracker = state.search_query_tracker.clone();
-                    if tracker.register(&prefix, task_id, desc.clone(), search_max_conc).await.is_some() {
+                    if tracker.register(&prefix, task_id, desc.clone(), search_max_conc, task_log_max).await.is_some() {
                         tracing::info!("[{}] [MAIN] search [{}] dispatched", prefix, task_id);
                         tracing::debug!("[MAIN] search [{}] desc: {}", task_id, desc);
                         crate::agent::tasklog::append(&prefix, &format!("dispatched #{task_id} search — {desc}"), task_log_max);
@@ -539,7 +526,7 @@ async fn dispatch_background_agents(
                 "advanced" => {
                     let task_id = state.next_id();
                     let tracker = state.advanced_task_tracker.clone();
-                    if tracker.register(&prefix, task_id, desc.clone(), advanced_max_conc).await.is_some() {
+                    if tracker.register(&prefix, task_id, desc.clone(), advanced_max_conc, task_log_max).await.is_some() {
                         tracing::info!("[{}] [MAIN] advanced [{}] dispatched", prefix, task_id);
                         tracing::debug!("[MAIN] advanced [{}] desc: {}", task_id, desc);
                         crate::agent::tasklog::append(&prefix, &format!("dispatched #{task_id} advanced — {desc}"), task_log_max);

@@ -90,7 +90,9 @@ pub async fn process_sse_stream(
 ) {
     use futures::StreamExt;
     let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
+    // Buffered as bytes: a chunk boundary can fall inside a multi-byte
+    // character, and decoding a partial sequence would corrupt it.
+    let mut buffer: Vec<u8> = Vec::new();
     let mut total_chars = 0usize;
 
     while let Some(chunk_result) = stream.next().await {
@@ -103,16 +105,17 @@ pub async fn process_sse_stream(
             }
         };
 
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.extend_from_slice(&chunk);
 
         // Parse all complete lines via index scanning — single drain at the end
         let mut consumed = 0;
-        while let Some(rel_end) = buffer[consumed..].find('\n') {
+        while let Some(rel_end) = buffer[consumed..].iter().position(|&b| b == b'\n') {
             let line_end = consumed + rel_end;
 
             // Parse inside a block so the buffer borrow is released before any await
             let maybe_chunk = {
-                let line = buffer[consumed..line_end].trim();
+                let decoded = String::from_utf8_lossy(&buffer[consumed..line_end]);
+                let line = decoded.trim();
                 if line.is_empty() || line.starts_with(':') {
                     None
                 } else {

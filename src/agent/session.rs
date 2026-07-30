@@ -54,7 +54,8 @@ impl ConversationSession {
 // Session Manager
 // ============================================================================
 
-/// Key for session lookup: `token_prefix` (one session per device)
+/// Key for session lookup: the full device token (one session per device).
+/// Truncated prefixes collide, which would merge two devices' histories.
 type SessionKey = String;
 
 /// Manages conversation sessions across all devices (one session per device).
@@ -99,14 +100,27 @@ impl SessionManager {
                     continue;
                 }
 
-                let session: Option<ConversationSession> = std::fs::read(&conv_path)
-                    .ok()
-                    .and_then(|data| decrypt_session(token, &data).ok())
-                    .and_then(|yaml| serde_yml::from_str(&yaml).ok());
+                let session = match std::fs::read(&conv_path) {
+                    Err(e) => {
+                        warn!("[SESSION] {} unreadable: {}", prefix, e);
+                        continue;
+                    }
+                    Ok(data) => match decrypt_session(token, &data) {
+                        Err(e) => {
+                            warn!("[SESSION] {} could not be decrypted: {}", prefix, e);
+                            continue;
+                        }
+                        Ok(yaml) => match serde_yml::from_str::<ConversationSession>(&yaml) {
+                            Err(e) => {
+                                warn!("[SESSION] {} could not be parsed: {}", prefix, e);
+                                continue;
+                            }
+                            Ok(session) => session,
+                        },
+                    },
+                };
 
-                if let Some(session) = session {
-                    batch.push((prefix, session));
-                }
+                batch.push((token.clone(), session));
             }
         }
 
@@ -124,10 +138,9 @@ impl SessionManager {
 
     /// Get chat history for a device.
     pub async fn get_history(&self, token: &str) -> Vec<ConversationTurn> {
-        let prefix = token_prefix(token);
         let sessions = self.sessions.read().await;
         sessions
-            .get(&prefix)
+            .get(token)
             .map(|s| s.turns.clone())
             .unwrap_or_default()
     }
@@ -135,10 +148,9 @@ impl SessionManager {
     /// Count completed conversation turns (user+assistant pairs) in a session.
     /// 1 turn = 1 user message + 1 assistant response.
     pub async fn turn_count(&self, token: &str) -> usize {
-        let prefix = token_prefix(token);
         let sessions = self.sessions.read().await;
         sessions
-            .get(&prefix)
+            .get(token)
             .map_or(0, |s| {
                 s.turns.iter().filter(|t| t.role == "user").count()
             })
@@ -152,7 +164,6 @@ impl SessionManager {
         content: &str,
         run_id: Option<&str>,
     ) {
-        let prefix = token_prefix(token);
         let turn = ConversationTurn {
             role: role.to_string(),
             content: content.to_string(),
@@ -161,7 +172,7 @@ impl SessionManager {
         };
         let snapshot = {
             let mut sessions = self.sessions.write().await;
-            let session = sessions.entry(prefix.clone()).or_insert_with(ConversationSession::new);
+            let session = sessions.entry(token.to_string()).or_insert_with(ConversationSession::new);
             session.add_turn(turn);
             let snap = session.clone();
             drop(sessions);

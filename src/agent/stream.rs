@@ -4,6 +4,7 @@
 //! blocks at the start of their output.  The main agent also emits
 //! `@@dispatch` blocks that must be hidden from the device.
 
+use super::markers::{BLOCK_CLOSE, DISPATCH_OPEN};
 use crate::provider::StreamChunk;
 
 /// Result of checking a stream buffer for `<think>` block prefix.
@@ -41,10 +42,10 @@ pub(crate) fn check_think_block(buf: &str) -> ThinkResult {
 fn safe_emit_end(text: &str) -> usize {
     // Ordered longest-first: "\n@@dispatch\n" always gives the most conservative
     // (smallest) hold-back, so matching it first and returning immediately is correct.
-    const MARKERS: &[&[u8]] = &[b"\n@@dispatch\n", b"@@dispatch\n"];
+    let markers: [&[u8]; 2] = [b"\n@@dispatch\n", DISPATCH_OPEN.as_bytes()];
     let bytes = text.as_bytes();
 
-    for marker in MARKERS {
+    for marker in markers {
         let max_check = marker.len().min(bytes.len());
         for len in (1..=max_check).rev() {
             let start = bytes.len() - len;
@@ -77,24 +78,24 @@ impl MarkerFilter {
             if remaining.is_empty() { break; }
 
             if self.eating {
-                // Look for \n@@end at end of block, or \n@@end\n mid-response
-                if let Some(pos) = remaining.find("\n@@end") {
-                    let end_tag_len = "\n@@end".len();
-                    let block_end = pos + end_tag_len;
-                    // Skip trailing newline if present
-                    if block_end < remaining.len() && remaining.as_bytes()[block_end] == b'\n' {
-                        self.committed += block_end + 1;
-                    } else {
-                        self.committed += block_end;
-                    }
-                    self.eating = false;
-                    continue;
+                // Not closed yet — wait for more data
+                let Some(pos) = remaining.find(BLOCK_CLOSE) else { break };
+                let block_end = pos + BLOCK_CLOSE.len();
+                // Wait until the byte after @@end is known, so the trailing
+                // newline is swallowed the same way regardless of chunking
+                if block_end == remaining.len() {
+                    break;
                 }
-                // Not found yet — wait for more data
-                break;
+                if remaining.as_bytes()[block_end] == b'\n' {
+                    self.committed += block_end + 1;
+                } else {
+                    self.committed += block_end;
+                }
+                self.eating = false;
+                continue;
             }
 
-            // Look for @@dispatch\n (preceded by \n or at start)
+            // Look for the next @@dispatch block
             if let Some(pos) = find_dispatch_start(remaining) {
                 if pos > 0 {
                     deltas.push(&remaining[..pos]);
@@ -125,23 +126,18 @@ impl MarkerFilter {
     }
 }
 
-/// Find the start of a `@@dispatch\n` marker in `text`, which must either
-/// be at position 0 or preceded by `\n`.
+/// Find the start of a `@@dispatch\n` marker in `text`, including the newline
+/// immediately before it so the block boundary does not leak.
+///
+/// Matches anywhere, exactly as `markers::parse_task_markers` does: anchoring
+/// to a line start here would let a mid-line block reach the device while the
+/// parser still dispatched it and stripped it from history.
 fn find_dispatch_start(text: &str) -> Option<usize> {
-    let mut search_from = 0;
-    loop {
-        let pos = text[search_from..].find("@@dispatch\n")?;
-        let abs = search_from + pos;
-        if abs == 0 || text.as_bytes()[abs - 1] == b'\n' {
-            // Include the preceding \n in what we eat (so it doesn't leak)
-            return if abs > 0 && text.as_bytes()[abs - 1] == b'\n' {
-                Some(abs - 1)
-            } else {
-                Some(abs)
-            };
-        }
-        // False positive (e.g. "foo@@dispatch\n") — skip past
-        search_from = abs + 1;
+    let abs = text.find(DISPATCH_OPEN)?;
+    if abs > 0 && text.as_bytes()[abs - 1] == b'\n' {
+        Some(abs - 1)
+    } else {
+        Some(abs)
     }
 }
 

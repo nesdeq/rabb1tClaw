@@ -75,12 +75,21 @@ fn generate_device_id() -> String {
     format!("{:x}{}", now_ms(), &generate_token()[..16])
 }
 
-/// Create a new device
-pub fn create_device(display_name: &str) -> Device {
+/// Create a new device with a token whose storage prefix is unused.
+/// The prefix is the per-device isolation key (session, workspace, memory,
+/// task log), so a duplicate would merge two devices' private state.
+pub fn create_device(store: &DeviceStore, display_name: &str) -> Device {
+    use crate::agent::session::token_prefix;
+    let taken: std::collections::HashSet<String> =
+        store.devices.values().map(|d| token_prefix(&d.token)).collect();
+    let token = std::iter::repeat_with(generate_token)
+        .find(|t| !taken.contains(&token_prefix(t)))
+        .unwrap_or_else(generate_token);
+
     Device {
         device_id: generate_device_id(),
         display_name: display_name.to_string(),
-        token: generate_token(),
+        token,
         revoked: false,
     }
 }

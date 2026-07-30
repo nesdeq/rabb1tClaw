@@ -56,6 +56,35 @@ pub(crate) enum ModelTier {
     Standard,
 }
 
+/// Whether an Anthropic model accepts `thinking: {type: "enabled", budget_tokens}`.
+///
+/// Extended thinking arrived with Claude 3.7 and was removed in Claude 4.7:
+/// newer models reject the parameter with HTTP 400, and older ones never had it.
+/// Unrecognised ids fall through to `Standard`, which sends no `thinking` key
+/// and is accepted by every Anthropic model.
+fn anthropic_supports_extended_thinking(model_id: &str) -> bool {
+    let id = model_id.to_lowercase();
+    const REMOVED: &[&str] = &[
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-haiku-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+    ];
+    if REMOVED.iter().any(|m| id.starts_with(m)) {
+        return false;
+    }
+    const SUPPORTED: &[&str] = &[
+        "claude-3-7",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-haiku-4",
+    ];
+    SUPPORTED.iter().any(|m| id.starts_with(m))
+}
+
 /// Detect model capabilities from `api_type` + `model_id`.
 pub(crate) fn detect_tier(api_type: &str, model_id: &str) -> ModelTier {
     let id = model_id.to_lowercase();
@@ -65,12 +94,12 @@ pub(crate) fn detect_tier(api_type: &str, model_id: &str) -> ModelTier {
         return ModelTier::Reasoning;
     }
 
-    // Anthropic thinking: everything except old claude-3 (non-3.5)
     if api_type == "anthropic" {
-        let is_old = id.starts_with("claude-3-") && !id.starts_with("claude-3-5");
-        if !is_old {
-            return ModelTier::Thinking;
-        }
+        return if anthropic_supports_extended_thinking(model_id) {
+            ModelTier::Thinking
+        } else {
+            ModelTier::Standard
+        };
     }
 
     // OSS reasoning models on DeepInfra / vLLM

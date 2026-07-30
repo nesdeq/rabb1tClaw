@@ -11,7 +11,7 @@
 
 rabb1tClaw implements the [OpenClaw](https://github.com/openclaw/openclaw) WebSocket protocol v3, giving your R1 a direct line to OpenAI, Anthropic, DeepInfra, or any OpenAI-compatible endpoint. Built on async Rust (Tokio + Axum), it handles hundreds of concurrent device connections with streaming responses that start arriving on the first token. Runs comfortably on a Raspberry Pi.
 
-43 Rust source files. 7,463 lines. That's the whole thing.
+44 Rust source files. 8,452 lines (7,572 of gateway, 880 of regression tests). That's the whole thing.
 
 <br clear="both">
 

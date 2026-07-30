@@ -7,7 +7,7 @@ use crate::agent::session::SessionManager;
 use crate::config::{DeviceStore, GatewayConfig};
 use crate::protocol::{now_ms, ErrorShape, OutgoingFrame, ResponseFrame};
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -51,8 +51,8 @@ pub type ConnectionRegistry = HashMap<String, Vec<ActiveConnection>>;
 /// Shared gateway state
 pub struct GatewayState {
     pub started_at: u64,
-    /// Active agent requests by `idempotency_key` (for request deduplication)
-    pub active_requests: RwLock<HashMap<String, Arc<tokio::sync::Notify>>>,
+    /// In-flight agent runs keyed by (device token, `idempotency_key`) for deduplication
+    pub active_requests: RwLock<HashSet<(Option<String>, String)>>,
     /// Gateway config - wrapped in `RwLock` for hot-reload
     pub gateway_config: RwLock<GatewayConfig>,
     /// Native device store - wrapped in `RwLock` for hot-reload
@@ -79,7 +79,7 @@ impl GatewayState {
     pub fn new(config: GatewayConfig, device_store: DeviceStore, debug_log: Option<DebugLog>) -> Self {
         Self {
             started_at: now_ms(),
-            active_requests: RwLock::new(HashMap::new()),
+            active_requests: RwLock::new(HashSet::new()),
             gateway_config: RwLock::new(config),
             device_store: RwLock::new(device_store),
             active_connections: RwLock::new(HashMap::new()),
@@ -155,6 +155,18 @@ impl GatewayState {
                 }
             }
         }
+
+        // Deleting a device outright is a revocation too
+        for (device_id, old_device) in &old_devices.devices {
+            if !new_devices.devices.contains_key(device_id) {
+                tracing::info!(
+                    device_id = %device_id,
+                    device_name = %old_device.display_name,
+                    "Device removed, will disconnect active sessions"
+                );
+                revoked_tokens.push(old_device.token.clone());
+            }
+        }
         drop(old_devices);
 
         // Update the device store
@@ -176,29 +188,32 @@ impl GatewayState {
         }
     }
 
-    /// Disconnect all active connections for the given device tokens
+    /// Disconnect all active connections for the given device tokens.
+    /// Targets are cloned out of the registry before any send: awaiting a
+    /// saturated channel under the lock would block every new connection.
     async fn disconnect_revoked_devices(&self, tokens: &[String]) {
-        let connections = self.active_connections.read().await;
+        let targets: Vec<ActiveConnection> = {
+            let connections = self.active_connections.read().await;
+            tokens
+                .iter()
+                .filter_map(|t| connections.get(t))
+                .flatten()
+                .cloned()
+                .collect()
+        };
 
-        for token in tokens {
-            if let Some(conns) = connections.get(token) {
-                for conn in conns {
-                    tracing::info!(
-                        conn_id = %conn.conn_id,
-                        "Disconnecting revoked device"
-                    );
+        for conn in targets {
+            tracing::info!(conn_id = %conn.conn_id, "Disconnecting revoked device");
 
-                    // Signal the receive loop to stop
-                    conn.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-                    conn.shutdown_notify.notify_one();
+            // Signal the receive loop to stop
+            conn.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            conn.shutdown_notify.notify_one();
 
-                    // Send close frame with policy violation code
-                    let _ = conn.tx.send(OutgoingFrame::Close {
-                        code: 1008,
-                        reason: "device_revoked".to_string(),
-                    }).await;
-                }
-            }
+            // Best effort: the shutdown notify is what actually ends the session
+            let _ = conn.tx.try_send(OutgoingFrame::Close {
+                code: 1008,
+                reason: "device_revoked".to_string(),
+            });
         }
     }
 }

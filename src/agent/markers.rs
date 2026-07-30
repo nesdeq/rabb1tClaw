@@ -10,8 +10,10 @@
 //!   [{"id":3,"answer":"..."}]
 //!   @@end
 
-const DISPATCH_OPEN: &str = "@@dispatch\n";
-const BLOCK_CLOSE: &str = "\n@@end";
+/// Block delimiters, shared with the streaming filter in `super::stream` so the
+/// live stream and the persisted text can never disagree on where a block is.
+pub(crate) const DISPATCH_OPEN: &str = "@@dispatch\n";
+pub(crate) const BLOCK_CLOSE: &str = "\n@@end";
 
 /// A parsed task marker from the LLM response.
 #[derive(Debug)]
@@ -54,6 +56,9 @@ pub fn parse_task_markers(response: &str) -> Vec<TaskMarker> {
 }
 
 /// Remove all `@@dispatch\n...\n@@end` blocks from a response.
+/// An unclosed block is suppressed through to the end of the response: its
+/// extent is unknown, and leaking raw dispatch JSON to a voice device is worse
+/// than losing the tail the model wrote inside a malformed block.
 pub fn strip_task_markers(response: &str) -> String {
     let mut result = String::with_capacity(response.len());
     let mut search_from = 0;
@@ -78,8 +83,7 @@ pub fn strip_task_markers(response: &str) -> String {
                 search_from = block_end;
             }
         } else {
-            // Unclosed block — keep it as-is
-            result.push_str(&response[abs_start..]);
+            // Unclosed block — suppress to the end, matching the stream filter
             return result;
         }
     }

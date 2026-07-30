@@ -356,14 +356,12 @@ async fn run_inner(
     // Starts at 1 (the task message). After the first LLM turn (plan), becomes 2.
     let mut pinned_count: usize = 1;
     let start_time = Instant::now();
-    // Time spent waiting for user answers — subtracted from elapsed to pause the clock.
-    let mut question_wait = std::time::Duration::ZERO;
     // Brief notes after each directive — included in error messages on failure.
     let mut progress: Vec<String> = Vec::new();
 
     for step in 1..=max_steps {
-        // Check total timeout (paused while waiting for user input)
-        let effective = start_time.elapsed().saturating_sub(question_wait);
+        // Check total timeout, which also bounds any wait for a user answer
+        let effective = start_time.elapsed();
         if effective.as_secs() >= total_timeout_secs {
             let base = format!("total timeout ({total_timeout_secs}s) exceeded");
             return Err((anyhow::anyhow!("{}", format_error_with_progress(&base, &progress)), step));
@@ -538,14 +536,18 @@ async fn run_inner(
                     });
                 }
 
-                // Wait for answer (no timeout — blocks until user responds)
-                // Total task timeout clock pauses during this wait.
-                let wait_start = Instant::now();
-                let Ok(answer) = answer_rx.await else {
-                    question_wait += wait_start.elapsed();
-                    return Err((anyhow::anyhow!("question channel closed"), step));
+                // Wait for an answer, bounded by whatever is left of the total
+                // timeout. An unbounded wait would hold the device's only
+                // advanced slot forever if the answer never arrives.
+                let remaining = std::time::Duration::from_secs(total_timeout_secs)
+                    .saturating_sub(start_time.elapsed());
+                let Ok(Ok(answer)) = tokio::time::timeout(remaining, answer_rx).await else {
+                    let base = format!("no answer within {}s", remaining.as_secs());
+                    return Err((
+                        anyhow::anyhow!("{}", format_error_with_progress(&base, &progress)),
+                        step,
+                    ));
                 };
-                question_wait += wait_start.elapsed();
 
                 if let Some(ref mut l) = log {
                     l.log("USER ANSWERED", &answer);
